@@ -32,6 +32,12 @@
 #include <Common/ErrnoException.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <IO/WriteBufferFromFileDecorator.h>
+#include <Interpreters/FileCache/FileCache.h>
+#include <Interpreters/FileCache/FileCacheFactory.h>
+#include <Interpreters/FileCache/FileCacheSettings.h>
+
+#include <fmt/format.h>
 
 // On illumos, <sys/regset.h> defines FS as a macro (x86 segment register).
 // Undef it to allow use of the FS:: namespace from filesystemHelpers.h.
@@ -59,8 +65,66 @@ namespace ErrorCodes
     extern const int CANNOT_STAT;
 }
 
+namespace FileCacheSetting
+{
+    extern const FileCacheSettingsString path;
+    extern const FileCacheSettingsBool cache_on_write_operations;
+}
+
 namespace
 {
+
+/// Runs an invalidation callback when a write is finalized or cancelled, so that
+/// bytes cached from a torn read during the write cannot outlive the write.
+class CacheInvalidatingWriteBuffer final : public WriteBufferFromFileDecorator
+{
+public:
+    CacheInvalidatingWriteBuffer(std::unique_ptr<WriteBufferFromFileBase> impl_, std::function<void()> invalidate_)
+        : WriteBufferFromFileDecorator(std::move(impl_))
+        , invalidate(std::move(invalidate_))
+    {
+    }
+
+protected:
+    void finalizeImpl() override
+    {
+        WriteBufferFromFileDecorator::finalizeImpl();
+        invalidate();
+    }
+
+    void cancelImpl() noexcept override
+    {
+        WriteBufferFromFileDecorator::cancelImpl();
+        try
+        {
+            invalidate();
+        }
+        catch (...)
+        {
+        }
+    }
+
+private:
+    std::function<void()> invalidate;
+};
+
+struct timespec getMTime(const struct stat & file_stat)
+{
+#if defined(OS_DARWIN)
+    return file_stat.st_mtimespec;
+#else
+    return file_stat.st_mtim;
+#endif
+}
+
+struct timespec getCTime(const struct stat & file_stat)
+{
+#if defined(OS_DARWIN)
+    return file_stat.st_ctimespec;
+#else
+    return file_stat.st_ctim;
+#endif
+}
 
 bool errnoIndicatesReadOnlyDisk(int err)
 {
@@ -358,11 +422,16 @@ DirectoryIteratorPtr DiskLocal::iterateDirectory(const String & path) const
 
 void DiskLocal::moveFile(const String & from_path, const String & to_path)
 {
+    /// No cache invalidation: the destination did not exist, and the version key
+    /// follows the inode, so an existing entry stays correct under the new path.
+    /// The same applies to `moveDirectory`, `renameExchange` and `createHardLink`.
     renameNoReplace(fs::path(disk_path) / from_path, fs::path(disk_path) / to_path);
 }
 
 void DiskLocal::replaceFile(const String & from_path, const String & to_path)
 {
+    /// The destination inode is replaced and its number can be reused later.
+    invalidateCacheEntry(to_path);
     fs::path from_file = fs::path(disk_path) / from_path;
     fs::path to_file = fs::path(disk_path) / to_path;
     fs::create_directories(to_file.parent_path());
@@ -377,6 +446,61 @@ void DiskLocal::renameExchange(const std::string & old_path, const std::string &
 bool DiskLocal::renameExchangeIfSupported(const std::string & old_path, const std::string & new_path)
 {
     return DB::renameExchangeIfSupported(fs::path(disk_path) / old_path, fs::path(disk_path) / new_path);
+}
+
+FileCacheKey DiskLocal::makeFileCacheKey(const struct stat & file_stat)
+{
+    const auto mtime = getMTime(file_stat);
+    const auto ctime = getCTime(file_stat);
+    return FileCacheKey::fromPath(fmt::format(
+        "local:{}:{}:{}:{}:{}:{}:{}",
+        static_cast<UInt64>(file_stat.st_dev),
+        static_cast<UInt64>(file_stat.st_ino),
+        static_cast<UInt64>(file_stat.st_size),
+        static_cast<Int64>(mtime.tv_sec),
+        static_cast<Int64>(mtime.tv_nsec),
+        static_cast<Int64>(ctime.tv_sec),
+        static_cast<Int64>(ctime.tv_nsec)));
+}
+
+void DiskLocal::invalidateCacheEntry(const struct stat & file_stat) const
+{
+    if (!filesystem_cache || !filesystem_cache->isInitialized() || !S_ISREG(file_stat.st_mode))
+        return;
+    filesystem_cache->removeKeyIfExists(makeFileCacheKey(file_stat), FileCache::getCommonOrigin().user_id);
+}
+
+void DiskLocal::invalidateCacheEntry(const String & path) const
+{
+    if (!filesystem_cache)
+        return;
+    struct stat file_stat{};
+    if (0 == ::stat((fs::path(disk_path) / path).c_str(), &file_stat))
+        invalidateCacheEntry(file_stat);
+}
+
+void DiskLocal::invalidateCacheTree(const String & path) const
+{
+    if (!filesystem_cache)
+        return;
+    auto full_path = fs::path(disk_path) / path;
+    struct stat file_stat{};
+    if (0 != ::stat(full_path.c_str(), &file_stat))
+        return;
+    if (S_ISREG(file_stat.st_mode))
+    {
+        invalidateCacheEntry(file_stat);
+        return;
+    }
+    if (!S_ISDIR(file_stat.st_mode))
+        return;
+    std::error_code ec;
+    for (const auto & entry : fs::recursive_directory_iterator(full_path, ec))
+    {
+        struct stat entry_stat{};
+        if (0 == ::stat(entry.path().c_str(), &entry_stat))
+            invalidateCacheEntry(entry_stat);
+    }
 }
 
 void DiskLocal::prepareRead(
@@ -396,6 +520,46 @@ void DiskLocal::prepareRead(
     auto file_size = fs::file_size(full_path, ec);
 
     StoredObject obj(full_path.string(), full_path.string(), ec ? StoredObject::UnknownSize : file_size);
+
+    /// Filesystem cache (on a second, faster disk), for regular non-empty files.
+    struct stat file_stat{};
+    bool use_filesystem_cache = filesystem_cache && filesystem_cache->isInitialized()
+        && settings.enable_filesystem_cache
+        && 0 == ::stat(full_path.c_str(), &file_stat) && S_ISREG(file_stat.st_mode) && file_stat.st_size > 0;
+
+    if (use_filesystem_cache)
+    {
+        /// The cached reader drives its impl via `seek`/`set`, which the async and
+        /// mmap local readers do not support, and O_DIRECT alignment is not
+        /// guaranteed for it. Force the synchronous reader underneath the cache,
+        /// the same way `LocalObjectStorage::patchSettings` does for the
+        /// object-storage local backend. Without this the cache would never
+        /// engage, because the default local read method is `pread_threadpool`.
+        auto cached_settings = settings;
+        cached_settings.local_fs_settings.method = LocalFSReadMethod::pread;
+        cached_settings.local_fs_settings.direct_io_threshold = 0;
+
+        pipeline.setLocalFileSource(
+            full_path.string(),
+            StoredObjects{obj},
+            cached_settings,
+            read_hint);
+
+        std::shared_ptr<FilesystemCacheLog> cache_log;
+        if (auto global_context = Context::getGlobalContextInstance())
+            cache_log = global_context->getFilesystemCacheLog();
+
+        pipeline.needFilesystemCache(
+            filesystem_cache,
+            makeFileCacheKey(file_stat),
+            filesystem_cache->getCommonOriginWithSegmentKeyType(full_path.string()),
+            cached_settings.filesystem_cache_settings,
+            cache_log);
+
+        /// The filesystem cache replaces the RAM page cache for this disk:
+        /// stacking both would keep the same bytes in RAM and on the cache disk.
+        return;
+    }
 
     /// No gather for local disk — the source buffer is returned directly.
     pipeline.setLocalFileSource(
@@ -441,8 +605,13 @@ void DiskLocal::prepareRead(
 std::unique_ptr<WriteBufferFromFileBase>
 DiskLocal::writeFile(const String & path, size_t buf_size, WriteMode mode, const WriteSettings & settings)
 {
+    /// Drop the pre-write version before the file is opened (truncated/appended to),
+    /// and again on finalize/cancel via the wrapper: a concurrent reader may have
+    /// re-cached torn bytes under a key that becomes current again.
+    invalidateCacheEntry(path);
+
     int flags = (mode == WriteMode::Append) ? (O_APPEND | O_CREAT | O_WRONLY) : -1;
-    return std::make_unique<WriteBufferFromFile>(
+    auto buffer = std::make_unique<WriteBufferFromFile>(
         fs::path(disk_path) / path,
         buf_size,
         flags,
@@ -452,6 +621,12 @@ DiskLocal::writeFile(const String & path, size_t buf_size, WriteMode mode, const
         0,
         settings.use_adaptive_write_buffer,
         settings.adaptive_write_buffer_initial_size);
+
+    if (!filesystem_cache)
+        return buffer;
+
+    return std::make_unique<CacheInvalidatingWriteBuffer>(
+        std::move(buffer), [this, path]() { invalidateCacheEntry(path); });
 }
 
 std::vector<String> DiskLocal::getBlobPath(const String & path) const
@@ -462,12 +637,25 @@ std::vector<String> DiskLocal::getBlobPath(const String & path) const
 
 void DiskLocal::writeFileUsingBlobWritingFunction(const String & path, WriteMode mode, WriteBlobFunction && write_blob_function)
 {
+    invalidateCacheEntry(path);
     auto fs_path = fs::path(disk_path) / path;
-    std::move(write_blob_function)({fs_path}, mode, {});
+    try
+    {
+        std::move(write_blob_function)({fs_path}, mode, {});
+    }
+    catch (...)
+    {
+        invalidateCacheEntry(path);
+        throw;
+    }
+    invalidateCacheEntry(path);
 }
 
 void DiskLocal::removeFile(const String & path)
 {
+    /// Invalidate before unlink: after it, the inode number can be reused by a
+    /// recreated file whose version key could otherwise collide with this entry.
+    invalidateCacheEntry(path);
     auto fs_path = fs::path(disk_path) / path;
     if (0 != unlink(fs_path.c_str()))
         ErrnoException::throwFromPath(ErrorCodes::CANNOT_UNLINK, fs_path, "Cannot unlink file {}", fs_path);
@@ -475,6 +663,7 @@ void DiskLocal::removeFile(const String & path)
 
 void DiskLocal::removeFileIfExists(const String & path)
 {
+    invalidateCacheEntry(path);
     auto fs_path = fs::path(disk_path) / path;
     if (0 != unlink(fs_path.c_str()))
     {
@@ -502,6 +691,7 @@ void DiskLocal::removeDirectoryIfExists(const String & path)
 
 void DiskLocal::removeRecursive(const String & path)
 {
+    invalidateCacheTree(path);
     (void)fs::remove_all(fs::path(disk_path) / path);
 }
 
@@ -514,6 +704,8 @@ void DiskLocal::listFiles(const String & path, std::vector<String> & file_names)
 
 void DiskLocal::setLastModified(const String & path, const Poco::Timestamp & timestamp)
 {
+    /// The mtime is part of the version key: drop the entry for the old stamp.
+    invalidateCacheEntry(path);
     FS::setModificationTime(fs::path(disk_path) / path, timestamp.epochTime());
 }
 
@@ -567,6 +759,7 @@ bool DiskLocal::equivalentNoThrow(const String & p1, const String & p2) const
 
 void DiskLocal::truncateFile(const String & path, size_t size)
 {
+    invalidateCacheEntry(path);
     int res = truncate((fs::path(disk_path) / path).string().data(), size);
     if (-1 == res)
         ErrnoException::throwFromPath(ErrorCodes::CANNOT_TRUNCATE_FILE, path, "Cannot truncate {}", path);
@@ -599,7 +792,13 @@ void DiskLocal::copyDirectoryContent(
 {
     /// If throttling was configured we cannot use copying directly.
     if (isSameDiskType(*this, *to_disk) && !read_settings.local_throttler && !write_settings.local_throttler)
+    {
+        /// The fast path bypasses `writeFile` of the destination disk, so drop its
+        /// cached entries for the overwritten tree upfront.
+        if (auto * local_to_disk = static_cast<DiskLocal *>(to_disk.get()); local_to_disk->filesystem_cache)
+            local_to_disk->invalidateCacheTree(to_dir);
         fs::copy(fs::path(disk_path) / from_dir, fs::path(to_disk->getPath()) / to_dir, fs::copy_options::recursive | fs::copy_options::overwrite_existing); /// Use more optimal way.
+    }
     else
         IDisk::copyDirectoryContent(from_dir, to_disk, to_dir, read_settings, write_settings, cancellation_hook);
 }
@@ -612,6 +811,13 @@ SyncGuardPtr DiskLocal::getDirectorySyncGuard(const String & path) const
 
 void DiskLocal::applyNewSettings(const Poco::Util::AbstractConfiguration & config, ContextPtr context, const String & config_prefix, const DisksMap & disk_map)
 {
+    /// Adding or removing the cache changes the disk's read path and cannot be
+    /// applied without recreating the disk; cache setting changes on an existing
+    /// cache are applied by `FileCacheFactory::updateSettingsFromConfig`.
+    if (config.has(config_prefix + ".filesystem_cache") != (filesystem_cache != nullptr))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Filesystem cache of disk {} cannot be added or removed without recreating the disk", name);
+
     String new_disk_path;
     UInt64 new_keep_free_space_bytes = 0;
 
@@ -627,19 +833,24 @@ void DiskLocal::applyNewSettings(const Poco::Util::AbstractConfiguration & confi
 }
 
 DiskLocal::DiskLocal(const String & name_, const String & path_, UInt64 keep_free_space_bytes_,
-                     const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
+                     const Poco::Util::AbstractConfiguration & config, const String & config_prefix,
+                     FileCachePtr filesystem_cache_, String filesystem_cache_name_)
     : IDisk(name_, config, config_prefix)
     , disk_path(path_)
+    , filesystem_cache(std::move(filesystem_cache_))
+    , filesystem_cache_name(std::move(filesystem_cache_name_))
     , keep_free_space_bytes(keep_free_space_bytes_)
     , logger(getLogger("DiskLocal"))
     , data_source_description(getLocalDataSourceDescription(disk_path))
 {
+    data_source_description.is_cached = filesystem_cache != nullptr;
 }
 
 DiskLocal::DiskLocal(
     const String & name_, const String & path_, UInt64 keep_free_space_bytes_, ContextPtr context,
-    const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
-    : DiskLocal(name_, path_, keep_free_space_bytes_, config, config_prefix)
+    const Poco::Util::AbstractConfiguration & config, const String & config_prefix,
+    FileCachePtr filesystem_cache_, String filesystem_cache_name_)
+    : DiskLocal(name_, path_, keep_free_space_bytes_, config, config_prefix, std::move(filesystem_cache_), std::move(filesystem_cache_name_))
 {
     auto local_disk_check_period_ms = config.getUInt("local_disk_check_period_ms", 0);
     if (local_disk_check_period_ms > 0)
@@ -734,6 +945,9 @@ void DiskLocal::startupImpl()
 {
     broken = false;
 
+    if (filesystem_cache)
+        filesystem_cache->initialize();
+
     try
     {
         setup();
@@ -759,6 +973,8 @@ struct stat DiskLocal::stat(const String & path) const
 
 void DiskLocal::chmod(const String & path, mode_t mode)
 {
+    /// `chmod` updates ctime, which is part of the version key.
+    invalidateCacheEntry(path);
     auto full_path = fs::path(disk_path) / path;
     if (::chmod(full_path.string().c_str(), mode) == 0)
         return;
@@ -794,14 +1010,54 @@ void registerDiskLocal(DiskFactory & factory, bool global_skip_access_check)
             if (path == disk_ptr->getPath())
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk {} and disk {} cannot have the same path ({})", name, disk_name, path);
 
+        /// Optional filesystem cache on a second (faster) disk, configured as a
+        /// nested section of the disk itself:
+        /// <filesystem_cache><path>/nvme/cache/</path><max_size>...</max_size></filesystem_cache>
+        /// Only for disks from server configuration: a cache created from a query
+        /// would silently outlive the table definition that created it.
+        FileCachePtr filesystem_cache;
+        String filesystem_cache_name;
+        const String filesystem_cache_prefix = config_prefix + ".filesystem_cache";
+        if (config.has(filesystem_cache_prefix))
+        {
+            if (custom_disk)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Filesystem cache for disk {} of type `local` can be configured only in server configuration", name);
+
+            FileCacheSettings file_cache_settings;
+            file_cache_settings.loadFromConfig(
+                config, filesystem_cache_prefix, getPathPrefixForRelativeCachePath(context), /* default_cache_path */ "");
+
+            /// Writes go to the local disk and only invalidate; they never populate.
+            if (file_cache_settings[FileCacheSetting::cache_on_write_operations].value)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Filesystem cache for disk {} of type `local` is read-through only, `cache_on_write_operations` is not supported", name);
+
+            const String cache_path = file_cache_settings[FileCacheSetting::path].value;
+            auto normalized = [](const String & p) { return fs::weakly_canonical(fs::path(p)).string(); };
+            const String normalized_disk_path = normalized(path);
+            const String normalized_cache_path = normalized(cache_path);
+            if (normalized_cache_path == normalized_disk_path
+                || pathStartsWith(normalized_cache_path, normalized_disk_path)
+                || pathStartsWith(normalized_disk_path, normalized_cache_path))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Filesystem cache path ({}) of disk {} must not lie inside the disk path ({}) or vice versa",
+                    cache_path, name, path);
+
+            filesystem_cache_name = name;
+            filesystem_cache = FileCacheFactory::instance().getOrCreate(
+                filesystem_cache_name, file_cache_settings, filesystem_cache_prefix);
+        }
+
         bool skip_access_check = config.getBool(config_prefix + ".skip_access_check", false) || global_skip_access_check;
         std::shared_ptr<IDisk> disk
-            = std::make_shared<DiskLocal>(name, path, keep_free_space_bytes, context, config, config_prefix);
+            = std::make_shared<DiskLocal>(name, path, keep_free_space_bytes, context, config, config_prefix,
+                std::move(filesystem_cache), std::move(filesystem_cache_name));
         disk->startup(skip_access_check);
         return disk;
     };
     factory.registerDiskType("local", creator, Documentation{
-        .description = "Stores data on the local filesystem at a configured path. This is the default disk used when no disks are configured.",
+        .description = "Stores data on the local filesystem at a configured path. This is the default disk used when no disks are configured. An optional nested `filesystem_cache` section (server configuration only) caches reads on a second, faster disk.",
         .syntax = "disk(type = local, path = '/var/lib/clickhouse/disk_local/')",
         .related = {"object_storage", "cache", "encrypted"}});
 }

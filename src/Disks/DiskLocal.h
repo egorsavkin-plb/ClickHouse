@@ -5,7 +5,11 @@
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/WriteBufferFromFile.h>
+#include <Interpreters/FileCache/FileCache_fwd.h>
+#include <Interpreters/FileCache/FileCacheKey.h>
 #include <Poco/Util/AbstractConfiguration.h>
+
+#include <sys/stat.h>
 
 
 namespace DB
@@ -20,7 +24,8 @@ public:
     friend class DiskLocalReservation;
 
     DiskLocal(const String & name_, const String & path_, UInt64 keep_free_space_bytes_,
-              const Poco::Util::AbstractConfiguration & config, const String & config_prefix);
+              const Poco::Util::AbstractConfiguration & config, const String & config_prefix,
+              FileCachePtr filesystem_cache_ = nullptr, String filesystem_cache_name_ = {});
 
     DiskLocal(
         const String & name_,
@@ -28,7 +33,8 @@ public:
         UInt64 keep_free_space_bytes_,
         ContextPtr context,
         const Poco::Util::AbstractConfiguration & config,
-        const String & config_prefix);
+        const String & config_prefix,
+        FileCachePtr filesystem_cache_ = nullptr, String filesystem_cache_name_ = {});
 
     DiskLocal(const String & name_, const String & path_);
 
@@ -133,6 +139,17 @@ public:
 
     bool supportZeroCopyReplication() const override { return false; }
 
+    bool supportsCache() const override { return filesystem_cache != nullptr; }
+
+    const String & getCacheName() const override { return filesystem_cache_name; }
+
+    NameSet getCacheLayersNames() const override
+    {
+        if (filesystem_cache)
+            return {filesystem_cache_name};
+        return {};
+    }
+
     SyncGuardPtr getDirectorySyncGuard(const String & path) const override;
 
     void applyNewSettings(const Poco::Util::AbstractConfiguration & config, ContextPtr context, const String & config_prefix, const DisksMap &) override;
@@ -158,11 +175,25 @@ protected:
 private:
     std::optional<UInt64> tryReserve(UInt64 bytes, const std::optional<ReservationConstraints> & constraints = std::nullopt);
 
+    /// Versioned filesystem-cache key for a regular file: the inode identity plus the
+    /// version stamps, so a rewrite at the same path (in place or by replacement) maps
+    /// to a different key, while renames and hard links keep sharing the entry.
+    static FileCacheKey makeFileCacheKey(const struct stat & file_stat);
+
+    /// Drop the cached entry for the file currently at `path`, if it is a regular file.
+    /// Used before/after mutations: versioned keys alone cannot cover inode reuse
+    /// after a delete followed by a recreate with identical size and timestamps.
+    void invalidateCacheEntry(const String & path) const;
+    void invalidateCacheEntry(const struct stat & file_stat) const;
+    void invalidateCacheTree(const String & path) const;
+
     /// Setup disk for healthy check.
     /// Throw exception if it's not possible to setup necessary files and directories.
     void setup();
 
     const String disk_path;
+    FileCachePtr filesystem_cache;
+    String filesystem_cache_name;
     std::atomic<UInt64> keep_free_space_bytes;
     LoggerPtr logger;
     DataSourceDescription data_source_description;

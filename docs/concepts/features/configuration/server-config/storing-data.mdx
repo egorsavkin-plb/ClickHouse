@@ -834,6 +834,33 @@ These settings should be defined in the disk configuration section. This table l
 
 > **Note**: Size values support units like `ki`, `Mi`, `Gi`, etc. (e.g., `10Gi`).
 
+### Filesystem cache for a local disk {#filesystem-cache-for-a-local-disk}
+
+A disk of type `local` can carry its own filesystem cache, configured as a nested `filesystem_cache` section in the disk definition in server configuration. This is intended for a slower local disk (for example an EBS volume) whose hot data should be served from a faster local disk (for example ephemeral NVMe instance storage), without changing how the data itself is stored: part files keep their plain local layout, so an existing volume needs no data migration, unlike switching the disk to `local_blob_storage`.
+
+```xml
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <ebs>
+                <type>local</type>
+                <path>/ebs/clickhouse/</path>
+                <filesystem_cache>
+                    <path>/nvme/filesystem_cache/</path>
+                    <max_size>100Gi</max_size>
+                </filesystem_cache>
+            </ebs>
+        </disks>
+    </storage_configuration>
+</clickhouse>
+```
+
+The section accepts the same settings as a cache disk (see the table above); `path` and `max_size` (or `max_size_ratio_to_total_space`) are required, and the cache path must not lie inside the disk path or vice versa. The cache is named after the disk, so it appears under that name in `system.filesystem_cache` and can be dropped with `SYSTEM DROP FILESYSTEM CACHE`. Relative cache paths are resolved under `filesystem_caches_path`.
+
+The cache is read-through only: reads populate it, writes go to the local disk and invalidate affected entries, and `cache_on_write_operations` is rejected for local disks. Cached entries are keyed by file version, and a rewrite of a file at the same path is never served stale after the write completes. Losing the cache disk (for example when an ephemeral instance store is replaced) is safe — the cache simply starts empty. Per-query behaviour is controlled by `enable_filesystem_cache`, as with cache disks.
+
+Only disks named in `storage_configuration` can take a cache, including an explicitly defined `default` disk; the implicit `default` disk used when no disks are configured cannot. The cache also cannot be defined for a disk created from SQL with `disk(type = local, ...)`, and adding or removing the section requires recreating the disk (a server restart), while changing other cache settings can be applied by configuration reload.
+
 ## File Cache Query/Profile Settings {#file-cache-query-profile-settings}
 
 | Setting                                                       | Type    | Default                 | Description                                                                                                                                                    |

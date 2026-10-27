@@ -46,6 +46,15 @@
                 <path>disks/test/local_plain_rewritable/</path>
                 <metadata_type>plain_rewritable</metadata_type>
             </local_plain_rewritable>
+            <!-- plain local disk with an embedded filesystem cache -->
+            <local_disk_cached>
+                <type>local</type>
+                <path>local_disk_cached/</path>
+                <filesystem_cache>
+                    <path>local_disk_cached_cache/</path>
+                    <max_size>104857600</max_size>
+                </filesystem_cache>
+            </local_disk_cached>
             <!-- multi layer cache -->
             <local_cache_multi>
                 <type>cache</type>
@@ -76,6 +85,13 @@
                     </main>
                 </volumes>
             </local_cache_3>
+            <local_disk_cached>
+                <volumes>
+                    <main>
+                        <disk>local_disk_cached</disk>
+                    </main>
+                </volumes>
+            </local_disk_cached>
         </policies>
     </storage_configuration>
 </clickhouse>

@@ -1,0 +1,12 @@
+Read-through populates the cache
+10000	49995000
+10000	49995000
+1
+10000	49995000
+Rewrite of a file at the same path is not served stale from the cache
+10000	1049995000
+Mutation and merge after priming
+10000	1049995010
+Delete and recreate with the same row count
+1000	499500
+1000	5499500

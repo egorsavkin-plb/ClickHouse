@@ -76,5 +76,53 @@ ${CLICKHOUSE_CLIENT} --query "$(agg_query)"
 echo 'Part data passes checksum verification after cached reads'
 ${CLICKHOUSE_CLIENT} --query "CHECK TABLE t_seek SETTINGS $READ_CACHED" | cut -f2
 
+echo 'Compact part multi-column seek reads and ReplacingMergeTree merge'
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_compact_seek SYNC"
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_compact_seek
+    (
+        id UInt64,
+        c1 String,
+        c2 String,
+        c3 UInt64,
+        c4 String,
+        c5 UInt64,
+        is_deleted UInt8,
+        version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version, is_deleted)
+    ORDER BY id
+    SETTINGS storage_policy = 'local_disk_cached', min_bytes_for_wide_part = 100000000"
+${CLICKHOUSE_CLIENT} --query "
+    INSERT INTO t_compact_seek
+    SELECT
+        number,
+        repeat('a', (number % 50) + 10),
+        repeat('b', (number % 70) + 20),
+        number * 11,
+        repeat('c', (number % 90) + 30),
+        number * 13,
+        0,
+        1
+    FROM numbers(5000)"
+${CLICKHOUSE_CLIENT} --query "
+    INSERT INTO t_compact_seek
+    SELECT
+        number,
+        repeat('d', (number % 50) + 10),
+        repeat('e', (number % 70) + 20),
+        number * 17,
+        repeat('f', (number % 90) + 30),
+        number * 19,
+        number % 2,
+        2
+    FROM numbers(2500)"
+# Read non-adjacent columns from the compact parts (`MergeTreeReaderCompactSingleBuffer` seeks across column stripes on one buffer).
+${CLICKHOUSE_CLIENT} --query "SELECT sum(id + is_deleted + version), sum(length(c1) + length(c4)) FROM t_compact_seek SETTINGS $READ_UNCACHED"
+${CLICKHOUSE_CLIENT} --query "SELECT sum(id + is_deleted + version), sum(length(c1) + length(c4)) FROM t_compact_seek SETTINGS $READ_CACHED"
+${CLICKHOUSE_CLIENT} --query "OPTIMIZE TABLE t_compact_seek FINAL SETTINGS $READ_CACHED"
+${CLICKHOUSE_CLIENT} --query "SELECT count(), sum(id + c5) FROM t_compact_seek FINAL SETTINGS $READ_CACHED"
+
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_compact_seek SYNC"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_seek SYNC"
 drop_filesystem_cache $CACHE_NAME

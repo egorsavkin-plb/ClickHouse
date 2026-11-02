@@ -10,3 +10,7 @@ Concurrent overlapping reads and a merge
 120000	11988000000	11950560000
 Part data passes checksum verification after cached reads
 1
+Compact part multi-column seek reads and ReplacingMergeTree merge
+15632500	815800
+15632500	815800
+3750	162457500

@@ -524,14 +524,25 @@ std::shared_ptr<ReadBufferFromFileBase> getRemoteReadBuffer(
 
             auto remote_fs_segment_reader = file_segment.getRemoteFileReader();
 
+            if (remote_fs_segment_reader
+                && remote_fs_segment_reader->getFileOffsetOfBufferEnd() != file_segment.getCurrentWriteOffset())
+            {
+                /// The previous downloader left the reader past the segment's
+                /// write offset (it buffered more than was written to the
+                /// cache). Continuing from it would splice bytes from a wrong
+                /// file offset into the segment, so start over with a fresh
+                /// reader positioned exactly at the write offset instead of
+                /// trusting the seek back. Remote readers are stateless range
+                /// readers and never diverge; a stateful local `pread` reader
+                /// behind `BoundedReadBuffer` can.
+                file_segment.resetRemoteFileReader();
+                remote_fs_segment_reader.reset();
+            }
+
             if (!remote_fs_segment_reader)
             {
                 remote_fs_segment_reader = create_remote_read_buffer();
                 file_segment.setRemoteFileReader(remote_fs_segment_reader);
-            }
-            else
-            {
-                chassert(remote_fs_segment_reader->getFileOffsetOfBufferEnd() == file_segment.getCurrentWriteOffset());
             }
 
             return remote_fs_segment_reader;

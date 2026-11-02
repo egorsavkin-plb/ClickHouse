@@ -1296,6 +1296,325 @@ TEST_F(FileCacheTest, CachedReadBuffer)
     }
 }
 
+/// Regression test for filesystem cache over a plain local file (the `DiskLocal`
+/// filesystem cache): the implementation buffer is a stateful `pread` reader
+/// created the same way `ReadPipeline` creates it for a local file source
+/// (engaged `read_hint` of 0, known file size), the cached buffer allows seeks
+/// and uses an external buffer. A reader that stops in the middle of a segment
+/// hands the segment over to background download; the bytes that end up in the
+/// cache (and are served afterwards) must be exactly the source file bytes at
+/// the segment offsets. Serving or storing bytes from a wrong offset here is
+/// what surfaces as checksum-mismatch exceptions on `MergeTree` reads in
+/// production.
+TEST_F(FileCacheTest, CachedReadBufferLocalFilePartialReadThenBackgroundDownload)
+{
+    ServerUUID::setRandomForUnitTests();
+    DB::ThreadStatus thread_status;
+
+    std::string query_id = "query_id_local_bg";
+    Poco::XML::DOMParser dom_parser;
+    std::string xml(R"CONFIG(<clickhouse>
+</clickhouse>)CONFIG");
+    Poco::AutoPtr<Poco::XML::Document> document = dom_parser.parseString(xml);
+    Poco::AutoPtr<Poco::Util::XMLConfiguration> config = new Poco::Util::XMLConfiguration(document);
+    getMutableContext().context->setConfig(config);
+
+    auto query_context = DB::Context::createCopy(getContext().context);
+    query_context->makeQueryContext();
+    query_context->setCurrentQueryId(query_id);
+    auto query_scope_holder = DB::QueryScope::create(query_context);
+
+    DB::FileCacheSettings settings;
+    settings[FileCacheSetting::path] = cache_base_path;
+    settings[FileCacheSetting::max_file_segment_size] = 10000;
+    settings[FileCacheSetting::max_size] = 10000000;
+    settings[FileCacheSetting::max_elements] = 1000;
+    settings[FileCacheSetting::boundary_alignment] = 1;
+    settings[FileCacheSetting::load_metadata_asynchronously] = false;
+    settings[FileCacheSetting::cache_policy] = FileCachePolicy::LRU;
+
+    ReadSettings read_settings;
+    read_settings.enable_filesystem_cache = true;
+    read_settings.local_fs_settings.method = LocalFSReadMethod::pread;
+
+    /// Deterministic content where a wrong-offset read is visible.
+    std::string s;
+    s.resize(100000);
+    for (size_t i = 0; i < s.size(); ++i)
+        s[i] = static_cast<char>((i * 31 + 7) % 251);
+
+    std::string file_path = fs::current_path() / "test_local_bg";
+    {
+        auto wb = std::make_unique<WriteBufferFromFile>(file_path, DBMS_DEFAULT_BUFFER_SIZE);
+        wb->write(s.data(), s.size());
+        wb->next();
+        wb->finalize();
+    }
+
+    /// Exactly how `ReadPipeline` builds the impl for a local file source under
+    /// the filesystem cache: engaged `read_hint` (0 when absent) and the known
+    /// file size forwarded to the reader.
+    auto read_buffer_creator = [&]()
+    {
+        return createReadBufferFromFileBase(file_path, read_settings, /* read_hint */ 0, /* file_size */ s.size());
+    };
+
+    auto cache = std::make_shared<DB::FileCache>("local_bg", settings);
+    cache->initialize();
+
+    auto key = DB::FileCacheKey::fromPath(file_path);
+    const auto & user = FileCache::getCommonOrigin();
+
+    auto make_cached_buffer = [&]()
+    {
+        return std::make_shared<CachedOnDiskReadBufferFromFile>(
+            file_path, key, cache, user, read_buffer_creator,
+            read_settings.filesystem_cache_settings,
+            /* remote_fs_buffer_size */ 64, /* local_fs_buffer_size */ 64,
+            query_id, s.size(),
+            /* allow_seeks_after_first_read */ true,
+            /* use_external_buffer */ false,
+            std::nullopt, nullptr);
+    };
+
+    /// Phase 1: seek into the middle of a segment, read a few bytes, then drop
+    /// the buffer. The partially downloaded segment is handed over to
+    /// background download.
+    {
+        auto buf = make_cached_buffer();
+        buf->seek(25050, SEEK_SET);
+        ASSERT_TRUE(buf->next());
+        ASSERT_GE(buf->available(), 10uz);
+        ASSERT_EQ(std::string_view(buf->position(), 10), std::string_view(s).substr(25050, 10));
+        buf->position() += 10;
+    }
+
+    /// Phase 2: another reader starts at the beginning, reads a few bytes, and
+    /// is dropped as well.
+    {
+        auto buf = make_cached_buffer();
+        ASSERT_TRUE(buf->next());
+        ASSERT_GE(buf->available(), 10uz);
+        ASSERT_EQ(std::string_view(buf->position(), 10), std::string_view(s).substr(0, 10));
+        buf->position() += 10;
+    }
+
+    /// Wait for background download to settle, then verify the stored segment
+    /// bytes directly against the source file.
+    {
+        bool all_downloaded = false;
+        for (int attempt = 0; attempt < 200 && !all_downloaded; ++attempt)
+        {
+            auto holder = cache->get(key, 0, s.size(), /* file_segments_limit */ 0, user.user_id);
+            all_downloaded = true;
+            for (const auto & segment : *holder)
+            {
+                if (segment->state() == FileSegment::State::DOWNLOADING
+                    || segment->state() == FileSegment::State::EMPTY
+                    || segment->state() == FileSegment::State::PARTIALLY_DOWNLOADED)
+                    all_downloaded = false;
+            }
+            /// Segments never touched by a reader have no remote reader to
+            /// continue a background download from; they settle as `DETACHED`
+            /// (or are dropped) and are simply re-created on the next read.
+            if (!all_downloaded)
+                std::this_thread::sleep_for(50ms);
+        }
+        ASSERT_TRUE(all_downloaded);
+
+        auto holder = cache->get(key, 0, s.size(), /* file_segments_limit */ 0, user.user_id);
+        for (const auto & segment : *holder)
+        {
+            if (segment->state() != FileSegment::State::DOWNLOADED
+                && segment->state() != FileSegment::State::PARTIALLY_DOWNLOADED)
+                continue;
+            const size_t downloaded = segment->state() == FileSegment::State::DOWNLOADED
+                ? segment->range().size() : segment->getDownloadedSize();
+            if (!downloaded)
+                continue;
+            std::ifstream in(segment->getPath(), std::ios::binary);
+            std::string cached((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            ASSERT_GE(cached.size(), downloaded);
+            ASSERT_EQ(cached.substr(0, downloaded), s.substr(segment->range().left, downloaded))
+                << "segment range " << segment->range().toString();
+        }
+    }
+
+    /// Phase 3: a full read through the cache must return the source bytes.
+    {
+        auto buf = make_cached_buffer();
+        WriteBufferFromOwnString result;
+        copyData(*buf, result);
+        ASSERT_EQ(result.str(), s);
+    }
+
+    /// Phase 5: concurrent readers seeking over the same segments, each
+    /// dropping its buffer in the middle of a segment (handing the download
+    /// over to other readers or to background download). Every byte served
+    /// must match the source file.
+    {
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> threads;
+        for (size_t t = 0; t < 8; ++t)
+        {
+            threads.emplace_back([&, t]()
+            {
+                DB::ThreadStatus thread_status_holder;
+                auto thread_query_context = DB::Context::createCopy(getContext().context);
+                thread_query_context->makeQueryContext();
+                thread_query_context->setCurrentQueryId(query_id + "_" + std::to_string(t));
+                auto thread_query_scope_holder = DB::QueryScope::create(thread_query_context);
+
+                for (size_t i = 0; i < 30 && !failed.load(); ++i)
+                {
+                    auto buf = make_cached_buffer();
+                    const size_t offset = (t * 9973 + i * 7919) % (s.size() - 100);
+                    buf->seek(static_cast<off_t>(offset), SEEK_SET);
+                    size_t read_total = 0;
+                    while (read_total < 5000 && buf->next())
+                    {
+                        const size_t n = std::min(buf->available(), 5000 - read_total);
+                        if (std::string_view(buf->position(), n) != std::string_view(s).substr(offset + read_total, n))
+                        {
+                            failed.store(true);
+                            break;
+                        }
+                        buf->position() += n;
+                        read_total += n;
+                    }
+                    /// Drop the buffer wherever it stopped.
+                }
+            });
+        }
+        for (auto & thread : threads)
+            thread.join();
+        ASSERT_FALSE(failed.load());
+    }
+
+    /// Phase 4: random seeks must return the source bytes at those offsets.
+    for (size_t offset : {0, 1, 9999, 10000, 10001, 25055, 50000, 99999})
+    {
+        auto buf = make_cached_buffer();
+        buf->seek(static_cast<off_t>(offset), SEEK_SET);
+        if (offset == s.size() - 1)
+        {
+            ASSERT_TRUE(buf->next());
+            ASSERT_EQ(buf->available(), 1uz);
+            ASSERT_EQ(*buf->position(), s[offset]);
+        }
+        else
+        {
+            ASSERT_TRUE(buf->next());
+            size_t n = std::min(buf->available(), s.size() - offset);
+            ASSERT_EQ(std::string_view(buf->position(), n), std::string_view(s).substr(offset, n));
+        }
+    }
+
+    /// Phase 6: the shape seen with a local disk under the cache in production:
+    /// background download disabled (segments are completed synchronously by
+    /// the next reader), a tiny impl buffer (the reader forwards the mark
+    /// range size as `read_hint`, shrinking the impl), and readers that die in
+    /// the middle of a segment download, handing the segment over to the next
+    /// reader. Served and stored bytes must stay byte-exact: a takeover that
+    /// continues from a reader positioned past the segment write offset would
+    /// splice wrong-offset bytes into the segment.
+    {
+        std::string s2;
+        s2.resize(100000);
+        for (size_t i = 0; i < s2.size(); ++i)
+            s2[i] = static_cast<char>((i * 17 + 3) % 241);
+
+        std::string file_path2 = fs::current_path() / "test_local_bg2";
+        {
+            auto wb = std::make_unique<WriteBufferFromFile>(file_path2, DBMS_DEFAULT_BUFFER_SIZE);
+            wb->write(s2.data(), s2.size());
+            wb->next();
+            wb->finalize();
+        }
+
+        ReadSettings tiny_read_settings = read_settings;
+        tiny_read_settings.local_fs_settings.buffer_size = 64;
+        tiny_read_settings.filesystem_cache_settings.allow_background_download = false;
+        tiny_read_settings.filesystem_cache_settings.allow_background_download_during_fetch = false;
+
+        auto tiny_read_buffer_creator = [&]()
+        {
+            return createReadBufferFromFileBase(file_path2, tiny_read_settings, /* read_hint */ 60, /* file_size */ s2.size());
+        };
+
+        auto key2 = DB::FileCacheKey::fromPath(file_path2);
+        auto make_tiny_cached_buffer = [&]()
+        {
+            return std::make_shared<CachedOnDiskReadBufferFromFile>(
+                file_path2, key2, cache, user, tiny_read_buffer_creator,
+                tiny_read_settings.filesystem_cache_settings,
+                /* remote_fs_buffer_size */ 64, /* local_fs_buffer_size */ 64,
+                query_id, s2.size(),
+                /* allow_seeks_after_first_read */ true,
+                /* use_external_buffer */ false,
+                std::nullopt, nullptr);
+        };
+
+        auto read_slice_and_verify = [&](size_t offset, size_t length)
+        {
+            auto buf = make_tiny_cached_buffer();
+            buf->seek(static_cast<off_t>(offset), SEEK_SET);
+            size_t read_total = 0;
+            while (read_total < length && buf->next())
+            {
+                const size_t n = std::min(buf->available(), length - read_total);
+                ASSERT_EQ(std::string_view(buf->position(), n), std::string_view(s2).substr(offset + read_total, n))
+                    << "offset " << offset + read_total;
+                buf->position() += n;
+                read_total += n;
+            }
+            ASSERT_EQ(read_total, length);
+        };
+
+        /// Short-lived readers dying mid-download, interleaved with verifiers.
+        for (size_t i = 0; i < 40; ++i)
+        {
+            const size_t offset = (i * 7919) % (s2.size() - 100);
+            {
+                auto buf = make_tiny_cached_buffer();
+                buf->seek(static_cast<off_t>(offset), SEEK_SET);
+                ASSERT_TRUE(buf->next());
+                const size_t n = std::min(buf->available(), 37uz);
+                ASSERT_EQ(std::string_view(buf->position(), n), std::string_view(s2).substr(offset, n));
+                /// Drop the buffer in the middle of the segment download.
+            }
+            if (i % 5 == 4)
+                read_slice_and_verify((i * 104729) % (s2.size() - 2000), 2000);
+        }
+
+        /// A full read through the cache must return the source bytes.
+        {
+            auto buf = make_tiny_cached_buffer();
+            WriteBufferFromOwnString result;
+            copyData(*buf, result);
+            ASSERT_EQ(result.str(), s2);
+        }
+
+        /// The stored segment bytes must equal the source bytes.
+        auto holder = cache->get(key2, 0, s2.size(), /* file_segments_limit */ 0, user.user_id);
+        for (const auto & segment : *holder)
+        {
+            if (segment->state() != FileSegment::State::DOWNLOADED
+                && segment->state() != FileSegment::State::PARTIALLY_DOWNLOADED)
+                continue;
+            const size_t downloaded = segment->state() == FileSegment::State::DOWNLOADED
+                ? segment->range().size() : segment->getDownloadedSize();
+            if (!downloaded)
+                continue;
+            std::ifstream in(segment->getPath(), std::ios::binary);
+            std::string cached((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            ASSERT_GE(cached.size(), downloaded);
+            ASSERT_EQ(cached.substr(0, downloaded), s2.substr(segment->range().left, downloaded))
+                << "segment range " << segment->range().toString();
+        }
+    }
+}
+
 namespace
 {
 

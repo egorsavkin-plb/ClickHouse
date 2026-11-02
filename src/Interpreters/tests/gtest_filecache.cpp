@@ -1491,23 +1491,51 @@ TEST_F(FileCacheTest, CachedReadBufferLocalFilePartialReadThenBackgroundDownload
         ASSERT_FALSE(failed.load());
     }
 
-    /// Phase 4: random seeks must return the source bytes at those offsets.
-    for (size_t offset : {0, 1, 9999, 10000, 10001, 25055, 50000, 99999})
+    /// Phase 4: random seeks must return the source bytes at those offsets, both on a
+    /// fresh buffer and when seeking multiple times on the same buffer after partial reads
+    /// (`MergeTreeReaderCompactSingleBuffer` seeks across column stripes on one buffer).
+    auto shared_seek_buf = make_cached_buffer();
+    for (size_t offset : {0, 1, 9999, 10000, 10001, 25055, 25080, 50000, 99999})
+    {
+        for (auto & buf : {make_cached_buffer(), shared_seek_buf})
+        {
+            buf->seek(static_cast<off_t>(offset), SEEK_SET);
+            ASSERT_EQ(static_cast<size_t>(buf->getPosition()), offset);
+            if (offset == s.size() - 1)
+            {
+                std::string got(1, '\0');
+                buf->readStrict(got.data(), 1);
+                ASSERT_EQ(got[0], s[offset]);
+            }
+            else
+            {
+                const size_t n = std::min(15uz, s.size() - offset);
+                std::string got(n, '\0');
+                buf->readStrict(got.data(), n);
+                ASSERT_EQ(got, s.substr(offset, n)) << "offset " << offset;
+            }
+        }
+    }
+
+    /// `setReadUntilPosition` after a partial read on the same buffer must discard
+    /// buffered bytes past the current position instead of shifting `getPosition()`
+    /// or serving leftover working-buffer bytes on the next read.
     {
         auto buf = make_cached_buffer();
-        buf->seek(static_cast<off_t>(offset), SEEK_SET);
-        if (offset == s.size() - 1)
+        buf->seek(100, SEEK_SET);
+        std::string first_part(10, '\0');
+        buf->readStrict(first_part.data(), 10);
+        ASSERT_EQ(first_part, s.substr(100, 10));
+        ASSERT_EQ(static_cast<size_t>(buf->getPosition()), 110uz);
+
+        buf->setReadUntilPosition(130);
+        ASSERT_EQ(static_cast<size_t>(buf->getPosition()), 110uz);
+        std::string rest;
         {
-            ASSERT_TRUE(buf->next());
-            ASSERT_EQ(buf->available(), 1uz);
-            ASSERT_EQ(*buf->position(), s[offset]);
+            WriteBufferFromString wb(rest);
+            copyData(*buf, wb);
         }
-        else
-        {
-            ASSERT_TRUE(buf->next());
-            size_t n = std::min(buf->available(), s.size() - offset);
-            ASSERT_EQ(std::string_view(buf->position(), n), std::string_view(s).substr(offset, n));
-        }
+        ASSERT_EQ(rest, s.substr(110, 20));
     }
 
     /// Phase 6: the shape seen with a local disk under the cache in production:

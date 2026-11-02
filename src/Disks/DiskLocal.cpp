@@ -546,6 +546,16 @@ void DiskLocal::prepareRead(
         cached_settings.local_fs_settings.method = LocalFSReadMethod::pread;
         cached_settings.local_fs_settings.direct_io_threshold = 0;
 
+        /// Do not finish abandoned segments from a detached background thread.
+        /// Continuation reuses the previous downloader's reader, which for a
+        /// local disk is a stateful `pread` reader whose buffered position is
+        /// only `chassert`ed to match the segment write offset; a mismatch
+        /// splices bytes from a wrong file offset into the segment. A local
+        /// source is cheap to re-read, so let the next reader complete the
+        /// segment synchronously (and verify it via checksums as it goes).
+        cached_settings.filesystem_cache_settings.allow_background_download = false;
+        cached_settings.filesystem_cache_settings.allow_background_download_during_fetch = false;
+
         pipeline.setLocalFileSource(
             full_path.string(),
             StoredObjects{obj},

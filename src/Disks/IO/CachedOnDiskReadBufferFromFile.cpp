@@ -2098,6 +2098,7 @@ off_t CachedOnDiskReadBufferFromFile::seek(off_t offset, int whence)
         throw Exception(ErrorCodes::CANNOT_SEEK_THROUGH_FILE, "Only SEEK_SET allowed");
     }
 
+    resetWorkingBuffer();
     first_offset = file_offset_of_buffer_end = new_pos;
 
     info.reset();
@@ -2135,6 +2136,7 @@ void CachedOnDiskReadBufferFromFile::setReadUntilPosition(size_t position)
         return;
 
     file_offset_of_buffer_end = getPosition();
+    resetWorkingBuffer();
 
     info.reset();
     state.reset();
@@ -2158,6 +2160,7 @@ void CachedOnDiskReadBufferFromFile::setIOSchedulingSettings(const IOSchedulingS
 
     /// Completes the file segments and destroys the readers while the previous links are valid.
     file_offset_of_buffer_end = getPosition();
+    resetWorkingBuffer();
     info.reset();
     state.reset();
     initialized = false;

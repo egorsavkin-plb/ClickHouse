@@ -189,6 +189,13 @@ private:
     /// cannot serve a stale entry.
     void invalidateCacheEntry(const String & path) const;
     void invalidateCacheEntry(const struct stat & file_stat) const;
+
+    /// Drop the cached entry for `path` only if unlinking it destroys the inode.
+    /// Used by removal paths: a file with several hard links (`ALTER TABLE ... FREEZE`
+    /// clones a part into `shadow/` with hard links, mutations and clones do the same)
+    /// keeps its content and its inode alive elsewhere, so the entry stays valid.
+    void invalidateCacheEntryBeforeUnlink(const String & path) const;
+
     void invalidateCacheTree(const String & path) const;
 
     /// Setup disk for healthy check.

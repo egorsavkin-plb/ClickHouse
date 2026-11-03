@@ -107,3 +107,36 @@ ${CLICKHOUSE_CLIENT} --query "
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_wt SYNC"
 drop_filesystem_cache $WT_CACHE
+
+echo 'FREEZE and UNFREEZE keep the live part entries in the cache'
+# `ALTER TABLE ... FREEZE` hard-links the part into `shadow/`, so the frozen clone shares the
+# live part's inodes. `UNFREEZE` then removes those links; the removal must not evict the cache
+# entries of a part that is still live (`st_nlink` back to 1 after the unlink).
+drop_filesystem_cache $WT_CACHE
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_freeze SYNC"
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_freeze (x UInt64, s String) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached_write_through', min_bytes_for_wide_part = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES t_freeze"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_freeze SELECT number, repeat('f', 40) FROM numbers(20000)"
+${CLICKHOUSE_CLIENT} --query "SELECT count() > 0 FROM system.filesystem_cache WHERE cache_name = '$WT_CACHE'"
+# Cache size is stable across the backup-style freeze/unfreeze cycle.
+${CLICKHOUSE_CLIENT} --query "SELECT current_size > 0 FROM system.filesystem_cache_settings WHERE cache_name = '$WT_CACHE'"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_freeze FREEZE WITH NAME 'test_05453'"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_freeze UNFREEZE WITH NAME 'test_05453'"
+# Every byte is still served from the cache: the unlink of the `shadow/` links must not have evicted it.
+${CLICKHOUSE_CLIENT} --query_id="freeze_read_${CLICKHOUSE_DATABASE}" --query "
+    SELECT count(), sum(x), sum(length(s)) FROM t_freeze
+    SETTINGS $READ_CACHED, read_from_filesystem_cache_if_exists_otherwise_bypass_cache = 1"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT ProfileEvents['CachedReadBufferReadFromCacheHits'] > 0,
+           ProfileEvents['CachedReadBufferReadFromCacheMisses'] = 0
+    FROM system.query_log
+    WHERE current_database = currentDatabase() AND query_id = 'freeze_read_${CLICKHOUSE_DATABASE}' AND type = 'QueryFinish'
+    ORDER BY event_time_microseconds DESC LIMIT 1"
+# Dropping the table does evict it: the last link to the inode is gone.
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_freeze SYNC"
+${CLICKHOUSE_CLIENT} --query "SELECT current_size = 0 FROM system.filesystem_cache_settings WHERE cache_name = '$WT_CACHE'"
+
+drop_filesystem_cache $WT_CACHE

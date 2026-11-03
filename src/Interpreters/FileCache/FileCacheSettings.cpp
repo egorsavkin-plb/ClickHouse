@@ -32,6 +32,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+/// TODO: Turn `cache_on_write_operations` default back to `false`.
 #define LIST_OF_FILE_CACHE_SETTINGS(DECLARE, ALIAS) \
     DECLARE(String, path, "", "Cache directory path", 0) \
     DECLARE(UInt64, max_size, 0, "Maximum cache size", 0) \
@@ -39,7 +40,7 @@ namespace ErrorCodes
     DECLARE(UInt64, max_file_segment_size, FILECACHE_DEFAULT_MAX_FILE_SEGMENT_SIZE, "Maximum size of a single file segment", 0) \
     DECLARE(UInt64, boundary_alignment, FILECACHE_DEFAULT_FILE_SEGMENT_ALIGNMENT, "File segment alignment", 0) \
     DECLARE(UInt64, reserve_granularity, FILECACHE_DEFAULT_MAX_RESERVE_GRANULARITY, "Maximum size to reserve ahead of the downloaded size of a file segment, to take the cache lock less often. Starts from 0 for each reader/writer and grows with its repeated reservations up to this value. 0 disables reserve-ahead.", 0) \
-    DECLARE(Bool, cache_on_write_operations, false, "Enables write-through cache (cache on INSERT and MERGE)", 0) \
+    DECLARE(Bool, cache_on_write_operations, true, "Enables write-through cache (cache on INSERT and MERGE)", 0) \
     DECLARE(FileCachePolicy, cache_policy, FILECACHE_DEFAULT_CACHE_POLICY, "Cache eviction policy", 0) \
     DECLARE(Double, slru_size_ratio, FILECACHE_DEFAULT_SLRU_RATIO, "SLRU cache policy size ratio of protected to probationary elements", 0) \
     DECLARE(UInt64, background_download_threads, FILECACHE_DEFAULT_BACKGROUND_DOWNLOAD_THREADS, "Number of background download threads. Value 0 disables background download", 0) \

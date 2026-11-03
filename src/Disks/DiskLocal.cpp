@@ -527,6 +527,27 @@ void DiskLocal::invalidateCacheEntry(const String & path) const
         invalidateCacheEntry(file_stat);
 }
 
+void DiskLocal::invalidateCacheEntryBeforeUnlink(const String & path) const
+{
+    if (!filesystem_cache)
+        return;
+    struct stat file_stat{};
+    if (0 != ::stat((fs::path(disk_path) / path).c_str(), &file_stat))
+        return;
+    if (!S_ISREG(file_stat.st_mode))
+        return;
+    /// The entry is keyed by (`st_dev`, `st_ino`), which is shared by every hard link of
+    /// the file. Removing one link of a multi-link file changes neither the content nor
+    /// the identity of the inode, and the surviving links keep the cache entry correct, so
+    /// the entry must be kept: `ALTER TABLE ... FREEZE` hard-links the whole part into
+    /// `shadow/`, and the following `UNFREEZE` removes those links. Evicting on that
+    /// removal would drop the still-live part's cached segments, which is exactly what
+    /// made a filesystem cache collapse to a few bytes every time a backup ran.
+    if (file_stat.st_nlink > 1)
+        return;
+    invalidateCacheEntry(file_stat);
+}
+
 void DiskLocal::invalidateCacheTree(const String & path) const
 {
     if (!filesystem_cache)
@@ -537,7 +558,7 @@ void DiskLocal::invalidateCacheTree(const String & path) const
         return;
     if (S_ISREG(file_stat.st_mode))
     {
-        invalidateCacheEntry(file_stat);
+        invalidateCacheEntryBeforeUnlink(path);
         return;
     }
     if (!S_ISDIR(file_stat.st_mode))
@@ -547,7 +568,14 @@ void DiskLocal::invalidateCacheTree(const String & path) const
     {
         struct stat entry_stat{};
         if (0 == ::stat(entry.path().c_str(), &entry_stat))
+        {
+            /// Same hard-link rule as `invalidateCacheEntryBeforeUnlink`: a tree removal
+            /// that only drops links to inodes still alive elsewhere (a `shadow/` clone,
+            /// a hard-linked mutation part) must not evict those entries.
+            if (S_ISREG(entry_stat.st_mode) && entry_stat.st_nlink > 1)
+                continue;
             invalidateCacheEntry(entry_stat);
+        }
     }
 }
 
@@ -760,8 +788,9 @@ void DiskLocal::writeFileUsingBlobWritingFunction(const String & path, WriteMode
 void DiskLocal::removeFile(const String & path)
 {
     /// Invalidate before unlink: after it, the inode number can be reused by a
-    /// recreated file whose version key could otherwise collide with this entry.
-    invalidateCacheEntry(path);
+    /// recreated file whose entry could otherwise collide with this one. A file
+    /// that still has other hard links keeps its entry (see `invalidateCacheEntryBeforeUnlink`).
+    invalidateCacheEntryBeforeUnlink(path);
     auto fs_path = fs::path(disk_path) / path;
     if (0 != unlink(fs_path.c_str()))
         ErrnoException::throwFromPath(ErrorCodes::CANNOT_UNLINK, fs_path, "Cannot unlink file {}", fs_path);
@@ -769,7 +798,7 @@ void DiskLocal::removeFile(const String & path)
 
 void DiskLocal::removeFileIfExists(const String & path)
 {
-    invalidateCacheEntry(path);
+    invalidateCacheEntryBeforeUnlink(path);
     auto fs_path = fs::path(disk_path) / path;
     if (0 != unlink(fs_path.c_str()))
     {

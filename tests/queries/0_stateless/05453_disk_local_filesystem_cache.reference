@@ -16,3 +16,9 @@ Write-through populates the cache on INSERT and merge without cold reads
 1	1
 10000	49995000	295000
 1	1
+FREEZE and UNFREEZE keep the live part entries in the cache
+1
+1
+20000	199990000	800000
+1	1
+1

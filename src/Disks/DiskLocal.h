@@ -178,14 +178,15 @@ protected:
 private:
     bool tryReserve(UInt64 bytes, const std::optional<ReservationConstraints> & constraints, UInt64 & unreserved_space);
 
-    /// Versioned filesystem-cache key for a regular file: the inode identity plus the
-    /// version stamps, so a rewrite at the same path (in place or by replacement) maps
-    /// to a different key, while renames and hard links keep sharing the entry.
+    /// Filesystem-cache key for a regular file: the device and inode identity
+    /// (`st_dev`, `st_ino`), which is known when a new file is opened for write
+    /// and stays invariant across renames and hard links. Every in-place mutation
+    /// or unlink invalidates the entry for that inode.
     static FileCacheKey makeFileCacheKey(const struct stat & file_stat);
 
     /// Drop the cached entry for the file currently at `path`, if it is a regular file.
-    /// Used before/after mutations: versioned keys alone cannot cover inode reuse
-    /// after a delete followed by a recreate with identical size and timestamps.
+    /// Used before/after in-place mutations and before unlinking so inode reuse
+    /// cannot serve a stale entry.
     void invalidateCacheEntry(const String & path) const;
     void invalidateCacheEntry(const struct stat & file_stat) const;
     void invalidateCacheTree(const String & path) const;

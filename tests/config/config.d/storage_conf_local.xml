@@ -55,6 +55,15 @@
                     <max_size>104857600</max_size>
                 </filesystem_cache>
             </local_disk_cached>
+            <local_disk_cached_write_through>
+                <type>local</type>
+                <path>local_disk_cached_write_through/</path>
+                <filesystem_cache>
+                    <path>local_disk_cached_write_through_cache/</path>
+                    <max_size>104857600</max_size>
+                    <cache_on_write_operations>1</cache_on_write_operations>
+                </filesystem_cache>
+            </local_disk_cached_write_through>
             <!-- multi layer cache -->
             <local_cache_multi>
                 <type>cache</type>
@@ -92,6 +101,13 @@
                     </main>
                 </volumes>
             </local_disk_cached>
+            <local_disk_cached_write_through>
+                <volumes>
+                    <main>
+                        <disk>local_disk_cached_write_through</disk>
+                    </main>
+                </volumes>
+            </local_disk_cached_write_through>
         </policies>
     </storage_configuration>
 </clickhouse>

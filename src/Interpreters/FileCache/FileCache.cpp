@@ -101,6 +101,7 @@ namespace FailPoints
 namespace FileCacheSetting
 {
     extern const FileCacheSettingsString path;
+    extern const FileCacheSettingsBool cache_on_write_operations;
     extern const FileCacheSettingsUInt64 max_size;
     extern const FileCacheSettingsUInt64 max_elements;
     extern const FileCacheSettingsUInt64 max_file_segment_size;
@@ -321,6 +322,7 @@ FileCache::FileCache(const std::string & cache_name, const FileCacheSettings & s
     , split_cache_ratio(settings[FileCacheSetting::split_cache_ratio])
     , system_cache_extensions(parseSystemCacheExtensions(settings[FileCacheSetting::system_cache_extensions].value))
     , skip_cache_on_disk_failure(settings[FileCacheSetting::skip_cache_on_disk_failure])
+    , cache_on_write_operations(settings[FileCacheSetting::cache_on_write_operations])
     , expose_eviction_metrics(settings[FileCacheSetting::expose_prometheus_eviction_metrics])
     , expose_eviction_metrics_per_user(settings[FileCacheSetting::expose_prometheus_eviction_metrics_per_user])
     , name(cache_name)
@@ -496,6 +498,11 @@ const String & FileCache::getBasePath() const
 bool FileCache::skipCacheOnDiskFailure() const
 {
     return skip_cache_on_disk_failure;
+}
+
+bool FileCache::cacheOnWriteOperations() const
+{
+    return cache_on_write_operations.load(std::memory_order_relaxed);
 }
 
 String FileCache::getFileSegmentPath(const Key & key, size_t offset, FileSegmentKind segment_kind, const OriginInfo & origin, std::optional<size_t> size) const
@@ -2948,6 +2955,16 @@ void FileCache::applySettingsIfPossible(const FileCacheSettings & new_settings, 
                  actual_settings[FileCacheSetting::idle_client_check_interval_sec].value,
                  new_settings[FileCacheSetting::idle_client_check_interval_sec].value);
         actual_settings[FileCacheSetting::idle_client_check_interval_sec] = new_settings[FileCacheSetting::idle_client_check_interval_sec];
+    }
+
+    if (new_settings[FileCacheSetting::cache_on_write_operations] != actual_settings[FileCacheSetting::cache_on_write_operations])
+    {
+        cache_on_write_operations.store(new_settings[FileCacheSetting::cache_on_write_operations], std::memory_order_relaxed);
+
+        LOG_INFO(log, "Changed cache_on_write_operations from {} to {}",
+                 actual_settings[FileCacheSetting::cache_on_write_operations].value,
+                 new_settings[FileCacheSetting::cache_on_write_operations].value);
+        actual_settings[FileCacheSetting::cache_on_write_operations] = new_settings[FileCacheSetting::cache_on_write_operations];
     }
 
     if (new_settings[FileCacheSetting::expose_prometheus_eviction_metrics] != actual_settings[FileCacheSetting::expose_prometheus_eviction_metrics])

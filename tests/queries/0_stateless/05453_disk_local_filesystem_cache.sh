@@ -67,3 +67,43 @@ ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cached_a SYNC"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cached_b SYNC"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cached_c SYNC"
 drop_filesystem_cache $CACHE_NAME
+
+echo 'Write-through populates the cache on INSERT and merge without cold reads'
+WT_CACHE='local_disk_cached_write_through'
+drop_filesystem_cache $WT_CACHE
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_wt SYNC"
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_wt (x UInt64, s String) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached_write_through', min_bytes_for_wide_part = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES t_wt"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_wt SELECT number, repeat('v', (number % 40) + 10) FROM numbers(5000)"
+${CLICKHOUSE_CLIENT} --query "SELECT count() > 0 FROM system.filesystem_cache WHERE cache_name = '$WT_CACHE'"
+# Read with read_from_filesystem_cache_if_exists_otherwise_bypass_cache: every byte is served from the write-through cache.
+${CLICKHOUSE_CLIENT} --query_id="wt_read_1_${CLICKHOUSE_DATABASE}" --query "
+    SELECT count(), sum(x), sum(length(s)) FROM t_wt
+    SETTINGS $READ_CACHED, read_from_filesystem_cache_if_exists_otherwise_bypass_cache = 1"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT ProfileEvents['CachedReadBufferReadFromCacheHits'] > 0,
+           ProfileEvents['CachedReadBufferReadFromCacheMisses'] = 0
+    FROM system.query_log
+    WHERE current_database = currentDatabase() AND query_id = 'wt_read_1_${CLICKHOUSE_DATABASE}' AND type = 'QueryFinish'
+    ORDER BY event_time_microseconds DESC LIMIT 1"
+
+# A second insert and a merge also populate the new merged part in the cache and evict the old source parts.
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_wt SELECT number + 5000, repeat('w', (number % 40) + 10) FROM numbers(5000)"
+${CLICKHOUSE_CLIENT} --query "SYSTEM START MERGES t_wt"
+${CLICKHOUSE_CLIENT} --query "OPTIMIZE TABLE t_wt FINAL"
+${CLICKHOUSE_CLIENT} --query_id="wt_read_2_${CLICKHOUSE_DATABASE}" --query "
+    SELECT count(), sum(x), sum(length(s)) FROM t_wt
+    SETTINGS $READ_CACHED, read_from_filesystem_cache_if_exists_otherwise_bypass_cache = 1"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT ProfileEvents['CachedReadBufferReadFromCacheHits'] > 0,
+           ProfileEvents['CachedReadBufferReadFromCacheMisses'] = 0
+    FROM system.query_log
+    WHERE current_database = currentDatabase() AND query_id = 'wt_read_2_${CLICKHOUSE_DATABASE}' AND type = 'QueryFinish'
+    ORDER BY event_time_microseconds DESC LIMIT 1"
+
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_wt SYNC"
+drop_filesystem_cache $WT_CACHE

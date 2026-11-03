@@ -33,10 +33,14 @@
 #include <Common/ErrnoException.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Disks/IO/CachedOnDiskWriteBufferFromFile.h>
+#include <IO/SwapHelper.h>
 #include <IO/WriteBufferFromFileDecorator.h>
 #include <Interpreters/FileCache/FileCache.h>
 #include <Interpreters/FileCache/FileCacheFactory.h>
 #include <Interpreters/FileCache/FileCacheSettings.h>
+#include <Common/CurrentThread.h>
+#include <Common/ThreadStatus.h>
 
 #include <fmt/format.h>
 
@@ -69,13 +73,20 @@ namespace ErrorCodes
 namespace FileCacheSetting
 {
     extern const FileCacheSettingsString path;
-    extern const FileCacheSettingsBool cache_on_write_operations;
 }
 
 namespace
 {
 
 std::atomic<UInt64> unsettled_file_reads{0};
+
+FileCacheKey makeLocalFileCacheKey(const struct stat & file_stat)
+{
+    return FileCacheKey::fromPath(fmt::format(
+        "local:{}:{}",
+        static_cast<UInt64>(file_stat.st_dev),
+        static_cast<UInt64>(file_stat.st_ino)));
+}
 
 /// Runs an invalidation callback when a write is finalized or cancelled, so that
 /// bytes cached from a torn read during the write cannot outlive the write.
@@ -111,23 +122,63 @@ private:
     std::function<void()> invalidate;
 };
 
-struct timespec getMTime(const struct stat & file_stat)
+/// Drops any cached entry for the file's inode on cancel (or if a write fails after
+/// partial write-through caching), so an aborted write leaves no partial or stale
+/// segments under that inode key.
+class WriteThroughCacheCleanupBuffer final : public WriteBufferFromFileDecorator
 {
-#if defined(OS_DARWIN)
-    return file_stat.st_mtimespec;
-#else
-    return file_stat.st_mtim;
-#endif
-}
+public:
+    WriteThroughCacheCleanupBuffer(
+        std::unique_ptr<WriteBufferFromFileBase> impl_,
+        FileCachePtr cache_,
+        FileCacheKey key_,
+        FileCache::UserID user_id_)
+        : WriteBufferFromFileDecorator(std::move(impl_))
+        , cache(std::move(cache_))
+        , key(key_)
+        , user_id(std::move(user_id_))
+    {
+    }
 
-struct timespec getCTime(const struct stat & file_stat)
-{
-#if defined(OS_DARWIN)
-    return file_stat.st_ctimespec;
-#else
-    return file_stat.st_ctim;
-#endif
-}
+    void preFinalize() override
+    {
+        /// `CachedOnDiskWriteBufferFromFile::nextImpl` populates the cache only when `next()`
+        /// is called. Flush the pending tail into the cache before `MergeTree` callers invoke
+        /// `sync()` between `preFinalize()` and `finalize()`: `WriteBufferFromFileDecorator::sync()`
+        /// calls `impl->sync()` directly, which would otherwise flush the underlying
+        /// `WriteBufferFromFile` without going through `CachedOnDiskWriteBufferFromFile::nextImpl`.
+        next();
+        WriteBufferFromFileDecorator::preFinalize();
+    }
+
+    void sync() override
+    {
+        /// Flush through `CachedOnDiskWriteBufferFromFile::nextImpl` first, then `fsync`
+        /// the underlying file descriptor.
+        next();
+        SwapHelper swap(*this, *impl);
+        impl->sync();
+    }
+
+protected:
+    void cancelImpl() noexcept override
+    {
+        WriteBufferFromFileDecorator::cancelImpl();
+        try
+        {
+            if (cache && cache->isInitialized())
+                cache->removeKeyIfExists(key, user_id);
+        }
+        catch (...)
+        {
+        }
+    }
+
+private:
+    FileCachePtr cache;
+    FileCacheKey key;
+    FileCache::UserID user_id;
+};
 
 bool errnoIndicatesReadOnlyDisk(int err)
 {
@@ -457,17 +508,7 @@ bool DiskLocal::renameExchangeIfSupported(const std::string & old_path, const st
 
 FileCacheKey DiskLocal::makeFileCacheKey(const struct stat & file_stat)
 {
-    const auto mtime = getMTime(file_stat);
-    const auto ctime = getCTime(file_stat);
-    return FileCacheKey::fromPath(fmt::format(
-        "local:{}:{}:{}:{}:{}:{}:{}",
-        static_cast<UInt64>(file_stat.st_dev),
-        static_cast<UInt64>(file_stat.st_ino),
-        static_cast<UInt64>(file_stat.st_size),
-        static_cast<Int64>(mtime.tv_sec),
-        static_cast<Int64>(mtime.tv_nsec),
-        static_cast<Int64>(ctime.tv_sec),
-        static_cast<Int64>(ctime.tv_nsec)));
+    return makeLocalFileCacheKey(file_stat);
 }
 
 void DiskLocal::invalidateCacheEntry(const struct stat & file_stat) const
@@ -632,14 +673,13 @@ void DiskLocal::prepareRead(
 std::unique_ptr<WriteBufferFromFileBase>
 DiskLocal::writeFile(const String & path, size_t buf_size, WriteMode mode, const WriteSettings & settings)
 {
-    /// Drop the pre-write version before the file is opened (truncated/appended to),
-    /// and again on finalize/cancel via the wrapper: a concurrent reader may have
-    /// re-cached torn bytes under a key that becomes current again.
+    /// Drop the pre-write entry before the file is opened (truncated/appended to).
     invalidateCacheEntry(path);
 
+    auto full_path = fs::path(disk_path) / path;
     int flags = (mode == WriteMode::Append) ? (O_APPEND | O_CREAT | O_WRONLY) : -1;
     auto buffer = std::make_unique<WriteBufferFromFile>(
-        fs::path(disk_path) / path,
+        full_path,
         buf_size,
         flags,
         settings.local_throttler,
@@ -651,6 +691,45 @@ DiskLocal::writeFile(const String & path, size_t buf_size, WriteMode mode, const
 
     if (!filesystem_cache)
         return buffer;
+
+    if (mode == WriteMode::Rewrite
+        && filesystem_cache->isInitialized()
+        && filesystem_cache->cacheOnWriteOperations()
+        && !settings.is_initial_access_check
+        && full_path.extension() != ".tmp")
+    {
+        struct stat file_stat{};
+        if (0 == ::fstat(buffer->getFD(), &file_stat) && S_ISREG(file_stat.st_mode))
+        {
+            const auto key = makeFileCacheKey(file_stat);
+            const auto origin = filesystem_cache->getCommonOriginWithSegmentKeyType(full_path.string());
+            /// Ensure the newly opened inode has no leftover segments from an earlier
+            /// incarnation before `CachedOnDiskWriteBufferFromFile` starts populating it.
+            filesystem_cache->removeKeyIfExists(key, origin.user_id);
+
+            std::shared_ptr<FilesystemCacheLog> cache_log;
+            if (auto global_context = Context::getGlobalContextInstance())
+                cache_log = global_context->getFilesystemCacheLog();
+
+            String query_id = CurrentThread::isInitialized() && CurrentThread::get().tryGetQueryContext()
+                ? std::string(CurrentThread::getQueryId())
+                : "";
+
+            auto cached_writer = std::make_unique<CachedOnDiskWriteBufferFromFile>(
+                std::move(buffer),
+                filesystem_cache,
+                full_path.string(),
+                key,
+                query_id,
+                settings,
+                origin,
+                cache_log,
+                /* is_distributed_cache */ false);
+
+            return std::make_unique<WriteThroughCacheCleanupBuffer>(
+                std::move(cached_writer), filesystem_cache, key, origin.user_id);
+        }
+    }
 
     return std::make_unique<CacheInvalidatingWriteBuffer>(
         std::move(buffer), [this, path]() { invalidateCacheEntry(path); });
@@ -731,8 +810,6 @@ void DiskLocal::listFiles(const String & path, std::vector<String> & file_names)
 
 void DiskLocal::setLastModified(const String & path, const Poco::Timestamp & timestamp)
 {
-    /// The mtime is part of the version key: drop the entry for the old stamp.
-    invalidateCacheEntry(path);
     FS::setModificationTime(fs::path(disk_path) / path, timestamp.epochTime());
 }
 
@@ -1000,8 +1077,6 @@ struct stat DiskLocal::stat(const String & path) const
 
 void DiskLocal::chmod(const String & path, mode_t mode)
 {
-    /// `chmod` updates ctime, which is part of the version key.
-    invalidateCacheEntry(path);
     auto full_path = fs::path(disk_path) / path;
     if (::chmod(full_path.string().c_str(), mode) == 0)
         return;
@@ -1054,11 +1129,6 @@ void registerDiskLocal(DiskFactory & factory, bool global_skip_access_check)
             FileCacheSettings file_cache_settings;
             file_cache_settings.loadFromConfig(
                 config, filesystem_cache_prefix, getPathPrefixForRelativeCachePath(context), /* default_cache_path */ "");
-
-            /// Writes go to the local disk and only invalidate; they never populate.
-            if (file_cache_settings[FileCacheSetting::cache_on_write_operations].value)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Filesystem cache for disk {} of type `local` is read-through only, `cache_on_write_operations` is not supported", name);
 
             const String cache_path = file_cache_settings[FileCacheSetting::path].value;
             auto normalized = [](const String & p) { return fs::weakly_canonical(fs::path(p)).string(); };

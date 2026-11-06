@@ -140,3 +140,34 @@ ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_freeze SYNC"
 ${CLICKHOUSE_CLIENT} --query "SELECT current_size = 0 FROM system.filesystem_cache_settings WHERE cache_name = '$WT_CACHE'"
 
 drop_filesystem_cache $WT_CACHE
+
+echo 'Removing a part while an external backup copy of it exists evicts the cache'
+# Altinity `clickhouse-backup` hard-links the frozen part into its own backup directory and,
+# after the upload, deletes that copy directly on the filesystem, outside the server. If the
+# live part is removed (merge, `DROP`, ...) while such a copy still exists, the server never
+# observes the copy's unlink, so it must evict at the live removal already -- deferring to
+# the last unlink leaks the entry (its inode is gone from the data disk, yet the cache keeps it).
+drop_filesystem_cache $WT_CACHE
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_backup SYNC"
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_backup (x UInt64, s String) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached_write_through', min_bytes_for_wide_part = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES t_backup"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_backup SELECT number, repeat('b', 40) FROM numbers(20000)"
+${CLICKHOUSE_CLIENT} --query "SELECT count() > 0 FROM system.filesystem_cache WHERE cache_name = '$WT_CACHE'"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_backup FREEZE WITH NAME 'test_05453_backup'"
+part_backup=$(${CLICKHOUSE_CLIENT} --query "SELECT path FROM system.parts WHERE database = currentDatabase() AND table = 't_backup' AND active LIMIT 1")
+# The backup tool's own hard-linked copy of the part, outside the table directory.
+backup_clone="$(dirname "$(dirname "$part_backup")")/bak05453_${CLICKHOUSE_DATABASE}"
+rm -rf "$backup_clone"
+cp -al "$part_backup" "$backup_clone"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_backup UNFREEZE WITH NAME 'test_05453_backup'"
+# The frozen clone is gone, but the live part (and the backup copy) still share the inodes:
+# the entry survives `UNFREEZE`, as in the case above.
+${CLICKHOUSE_CLIENT} --query "SELECT current_size > 0 FROM system.filesystem_cache_settings WHERE cache_name = '$WT_CACHE'"
+# Removing the live part evicts despite the backup copy's extra hard link.
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_backup SYNC"
+${CLICKHOUSE_CLIENT} --query "SELECT current_size = 0 FROM system.filesystem_cache_settings WHERE cache_name = '$WT_CACHE'"
+rm -rf "$backup_clone"
+
+drop_filesystem_cache $WT_CACHE

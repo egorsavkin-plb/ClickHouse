@@ -190,10 +190,12 @@ private:
     void invalidateCacheEntry(const String & path) const;
     void invalidateCacheEntry(const struct stat & file_stat) const;
 
-    /// Drop the cached entry for `path` only if unlinking it destroys the inode.
-    /// Used by removal paths: a file with several hard links (`ALTER TABLE ... FREEZE`
-    /// clones a part into `shadow/` with hard links, mutations and clones do the same)
-    /// keeps its content and its inode alive elsewhere, so the entry stays valid.
+    /// Drop the cached entry for `path` before unlinking it, except when `path` is a
+    /// frozen clone under `shadow/` that still has other hard links: `ALTER TABLE ... FREEZE`
+    /// clones a part into `shadow/` with hard links, and removing those links on
+    /// `UNFREEZE` must keep the still-live part's entry. Every other removal evicts
+    /// even for multi-link files, because another link (e.g. a backup copy) may be
+    /// unlinked outside this server, where the eviction would never happen.
     void invalidateCacheEntryBeforeUnlink(const String & path) const;
 
     void invalidateCacheTree(const String & path) const;

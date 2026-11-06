@@ -22,3 +22,7 @@ FREEZE and UNFREEZE keep the live part entries in the cache
 20000	199990000	800000
 1	1
 1
+Removing a part while an external backup copy of it exists evicts the cache
+1
+1
+1

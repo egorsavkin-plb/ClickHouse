@@ -88,6 +88,18 @@ FileCacheKey makeLocalFileCacheKey(const struct stat & file_stat)
         static_cast<UInt64>(file_stat.st_ino)));
 }
 
+/// Frozen clones created by `ALTER TABLE ... FREEZE` live under a `shadow` directory
+/// component (see `FreezeMetaData` / `MergeTreeData::freezePartitionsByMatcher`).
+bool isFrozenClonePath(const String & path)
+{
+    for (const auto & component : fs::path(path))
+    {
+        if (component.string() == "shadow")
+            return true;
+    }
+    return false;
+}
+
 /// Runs an invalidation callback when a write is finalized or cancelled, so that
 /// bytes cached from a torn read during the write cannot outlive the write.
 class CacheInvalidatingWriteBuffer final : public WriteBufferFromFileDecorator
@@ -537,13 +549,20 @@ void DiskLocal::invalidateCacheEntryBeforeUnlink(const String & path) const
     if (!S_ISREG(file_stat.st_mode))
         return;
     /// The entry is keyed by (`st_dev`, `st_ino`), which is shared by every hard link of
-    /// the file. Removing one link of a multi-link file changes neither the content nor
-    /// the identity of the inode, and the surviving links keep the cache entry correct, so
-    /// the entry must be kept: `ALTER TABLE ... FREEZE` hard-links the whole part into
-    /// `shadow/`, and the following `UNFREEZE` removes those links. Evicting on that
-    /// removal would drop the still-live part's cached segments, which is exactly what
-    /// made a filesystem cache collapse to a few bytes every time a backup ran.
-    if (file_stat.st_nlink > 1)
+    /// the file. Removing a frozen clone under `shadow/` changes neither the content nor
+    /// the identity of the inode, and the surviving live link keeps the cache entry
+    /// correct, so the entry must be kept: `ALTER TABLE ... FREEZE` hard-links the whole
+    /// part into `shadow/`, and the following `UNFREEZE` removes those links. Evicting on
+    /// that removal would drop the still-live part's cached segments, which is exactly
+    /// what made a filesystem cache collapse to a few bytes every time a backup ran.
+    ///
+    /// Any other removal must evict even when `st_nlink > 1`: the other link may be a
+    /// backup copy (e.g. Altinity `clickhouse-backup` hard-links the frozen part and
+    /// later deletes its copy directly on the filesystem, outside this server), whose
+    /// eventual unlink this disk never observes. Deferring the eviction to that last
+    /// unlink would leak the entry for good (and a later file reusing the inode could
+    /// be served its stale bytes).
+    if (file_stat.st_nlink > 1 && isFrozenClonePath(path))
         return;
     invalidateCacheEntry(file_stat);
 }
@@ -563,16 +582,17 @@ void DiskLocal::invalidateCacheTree(const String & path) const
     }
     if (!S_ISDIR(file_stat.st_mode))
         return;
+    const bool frozen_clone = isFrozenClonePath(path);
     std::error_code ec;
     for (const auto & entry : fs::recursive_directory_iterator(full_path, ec))
     {
         struct stat entry_stat{};
         if (0 == ::stat(entry.path().c_str(), &entry_stat))
         {
-            /// Same hard-link rule as `invalidateCacheEntryBeforeUnlink`: a tree removal
-            /// that only drops links to inodes still alive elsewhere (a `shadow/` clone,
-            /// a hard-linked mutation part) must not evict those entries.
-            if (S_ISREG(entry_stat.st_mode) && entry_stat.st_nlink > 1)
+            /// Same hard-link rule as `invalidateCacheEntryBeforeUnlink`: only a
+            /// `shadow/` tree removal may keep multi-link entries, because the live
+            /// links survive it; every other tree removal evicts them.
+            if (frozen_clone && S_ISREG(entry_stat.st_mode) && entry_stat.st_nlink > 1)
                 continue;
             invalidateCacheEntry(entry_stat);
         }
@@ -788,8 +808,8 @@ void DiskLocal::writeFileUsingBlobWritingFunction(const String & path, WriteMode
 void DiskLocal::removeFile(const String & path)
 {
     /// Invalidate before unlink: after it, the inode number can be reused by a
-    /// recreated file whose entry could otherwise collide with this one. A file
-    /// that still has other hard links keeps its entry (see `invalidateCacheEntryBeforeUnlink`).
+    /// recreated file whose entry could otherwise collide with this one. Only a
+    /// frozen clone under `shadow/` keeps its entry (see `invalidateCacheEntryBeforeUnlink`).
     invalidateCacheEntryBeforeUnlink(path);
     auto fs_path = fs::path(disk_path) / path;
     if (0 != unlink(fs_path.c_str()))

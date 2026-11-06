@@ -126,6 +126,8 @@ public:
 
     bool skipCacheOnDiskFailure() const;
 
+    bool cacheOnWriteOperations() const;
+
     static const FileCacheOriginInfo & getCommonOrigin();
 
     static const OriginInfo & getInternalOrigin();
@@ -343,6 +345,7 @@ private:
     const std::set<std::string> system_cache_extensions;
 
     const bool skip_cache_on_disk_failure;
+    std::atomic<bool> cache_on_write_operations;
     std::atomic<bool> expose_eviction_metrics;
     std::atomic<bool> expose_eviction_metrics_per_user;
 

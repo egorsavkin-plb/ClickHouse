@@ -621,6 +621,26 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::buildSingleObjectStage(con
                     impl_use_external_buffer, /* restrict_seek */ false);
             };
         }
+        else if (const auto * local_src = std::get_if<LocalFileSource>(&source->source))
+        {
+            /// A local file as the cached reader's impl: it must be seekable and
+            /// accept the cached reader driving it via `set`. `pread`-style local
+            /// readers satisfy this the same way they do under the object-storage
+            /// local backend; `DiskLocal::prepareRead` only adds the cache stage
+            /// for such read methods. Reader selection keeps the non-cached
+            /// semantics: hint from `read_hint`, known size only as an EOF guard.
+            impl_creator = [path = local_src->path, read_hint = local_src->read_hint,
+                            captured_object = object, captured_settings = settings]()
+                -> std::unique_ptr<ReadBufferFromFileBase>
+            {
+                std::optional<size_t> file_size;
+                if (captured_object.bytes_size != StoredObject::UnknownSize && captured_object.bytes_size != 0)
+                    file_size = captured_object.bytes_size;
+
+                return createReadBufferFromFileBase(
+                    path, captured_settings, read_hint.value_or(0), file_size);
+            };
+        }
         else if (const auto * cust_src = std::get_if<CustomSource>(&source->source))
         {
             impl_creator = [creator = cust_src->creator, captured_object = object, captured_settings = settings]()
@@ -632,7 +652,7 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::buildSingleObjectStage(con
         else
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "ReadPipeline: filesystem cache without gather requires ObjectStorageSource or CustomSource");
+                "ReadPipeline: filesystem cache without gather requires ObjectStorageSource, LocalFileSource or CustomSource");
         }
 
         /// Wrap inner cache layers (all except the outermost). Each layer's

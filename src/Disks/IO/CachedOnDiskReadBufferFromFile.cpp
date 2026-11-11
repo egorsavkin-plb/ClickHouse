@@ -1413,7 +1413,7 @@ bool CachedOnDiskReadBufferFromFile::nextImplStep()
                 file_segment.completePartAndResetDownloader();
             }
 
-            if (use_external_buffer && !internal_buffer.empty())
+            if (!internal_buffer.empty())
                 internal_buffer.resize(original_buffer_size);
 
             chassert(!file_segment.isDownloader(), "!isDownloader() failed in scope exit: " + getInfoForLog());
@@ -1439,7 +1439,7 @@ bool CachedOnDiskReadBufferFromFile::nextImplStep()
     auto & file_segment = info.file_segments->front();
     const auto & current_read_range = file_segment.range();
 
-    if (use_external_buffer && state->read_type == ReadType::CACHED)
+    if (state->read_type == ReadType::CACHED)
     {
         /// We allocate buffers not less than 1M so that s3 requests will not be too small. But the same buffers (members of AsynchronousReadIndirectBufferFromRemoteFS)
         /// are used for reading from files. Some of these readings are fairly small and their performance degrade when we use big buffers (up to ~20% for queries like Q23 from ClickBench).

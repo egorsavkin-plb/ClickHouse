@@ -104,6 +104,7 @@ namespace DB::ErrorCodes
 {
     extern const int FILECACHE_ACCESS_DENIED;
     extern const int CANNOT_READ_ALL_DATA;
+    extern const int FAULT_INJECTED;
 }
 namespace DB::FileCacheSetting
 {
@@ -1293,6 +1294,353 @@ TEST_F(FileCacheTest, CachedReadBuffer)
         cached_buffer->position() = cached_buffer->buffer().end();
         cached_buffer->next();
         assertEqual(cache->dumpQueue(), {Range(15, 19), Range(20, 24), Range(25, 29), Range(0, 4), Range(5, 9), Range(10, 14)});
+    }
+}
+
+/// Regression test for filesystem cache over a plain local file (the `DiskLocal`
+/// filesystem cache): the implementation buffer is a stateful `pread` reader
+/// created the same way `ReadPipeline` creates it for a local file source
+/// (engaged `read_hint` of 0, known file size), the cached buffer allows seeks
+/// and uses an external buffer. A reader that stops in the middle of a segment
+/// hands the segment over to background download; the bytes that end up in the
+/// cache (and are served afterwards) must be exactly the source file bytes at
+/// the segment offsets. Serving or storing bytes from a wrong offset here is
+/// what surfaces as checksum-mismatch exceptions on `MergeTree` reads in
+/// production.
+TEST_F(FileCacheTest, CachedReadBufferLocalFilePartialReadThenBackgroundDownload)
+{
+    ServerUUID::setRandomForUnitTests();
+    DB::ThreadStatus thread_status;
+
+    std::string query_id = "query_id_local_bg";
+    Poco::XML::DOMParser dom_parser;
+    std::string xml(R"CONFIG(<clickhouse>
+</clickhouse>)CONFIG");
+    Poco::AutoPtr<Poco::XML::Document> document = dom_parser.parseString(xml);
+    Poco::AutoPtr<Poco::Util::XMLConfiguration> config = new Poco::Util::XMLConfiguration(document);
+    getMutableContext().context->setConfig(config);
+
+    auto query_context = DB::Context::createCopy(getContext().context);
+    query_context->makeQueryContext();
+    query_context->setCurrentQueryId(query_id);
+    auto query_scope_holder = DB::QueryScope::create(query_context);
+
+    DB::FileCacheSettings settings;
+    settings[FileCacheSetting::path] = cache_base_path;
+    settings[FileCacheSetting::max_file_segment_size] = 10000;
+    settings[FileCacheSetting::max_size] = 10000000;
+    settings[FileCacheSetting::max_elements] = 1000;
+    settings[FileCacheSetting::boundary_alignment] = 1;
+    settings[FileCacheSetting::load_metadata_asynchronously] = false;
+    settings[FileCacheSetting::cache_policy] = FileCachePolicy::LRU;
+
+    ReadSettings read_settings;
+    read_settings.enable_filesystem_cache = true;
+    read_settings.local_fs_settings.method = LocalFSReadMethod::pread;
+
+    /// Deterministic content where a wrong-offset read is visible.
+    std::string s;
+    s.resize(100000);
+    for (size_t i = 0; i < s.size(); ++i)
+        s[i] = static_cast<char>((i * 31 + 7) % 251);
+
+    std::string file_path = fs::current_path() / "test_local_bg";
+    {
+        auto wb = std::make_unique<WriteBufferFromFile>(file_path, DBMS_DEFAULT_BUFFER_SIZE);
+        wb->write(s.data(), s.size());
+        wb->next();
+        wb->finalize();
+    }
+
+    /// Exactly how `ReadPipeline` builds the impl for a local file source under
+    /// the filesystem cache: engaged `read_hint` (0 when absent) and the known
+    /// file size forwarded to the reader.
+    auto read_buffer_creator = [&]()
+    {
+        return createReadBufferFromFileBase(file_path, read_settings, /* read_hint */ 0, /* file_size */ s.size());
+    };
+
+    auto cache = std::make_shared<DB::FileCache>("local_bg", settings);
+    cache->initialize();
+
+    auto key = DB::FileCacheKey::fromPath(file_path);
+    const auto & user = FileCache::getCommonOrigin();
+
+    auto make_cached_buffer = [&]()
+    {
+        return std::make_shared<CachedOnDiskReadBufferFromFile>(
+            file_path, key, cache, user, read_buffer_creator,
+            read_settings.filesystem_cache_settings,
+            /* remote_fs_buffer_size */ 64, /* local_fs_buffer_size */ 64,
+            query_id, s.size(),
+            /* allow_seeks_after_first_read */ true,
+            /* use_external_buffer */ false,
+            std::nullopt, nullptr);
+    };
+
+    /// Phase 1: seek into the middle of a segment, read a few bytes, then drop
+    /// the buffer. The partially downloaded segment is handed over to
+    /// background download.
+    {
+        auto buf = make_cached_buffer();
+        buf->seek(25050, SEEK_SET);
+        ASSERT_TRUE(buf->next());
+        ASSERT_GE(buf->available(), 10uz);
+        ASSERT_EQ(std::string_view(buf->position(), 10), std::string_view(s).substr(25050, 10));
+        buf->position() += 10;
+    }
+
+    /// Phase 2: another reader starts at the beginning, reads a few bytes, and
+    /// is dropped as well.
+    {
+        auto buf = make_cached_buffer();
+        ASSERT_TRUE(buf->next());
+        ASSERT_GE(buf->available(), 10uz);
+        ASSERT_EQ(std::string_view(buf->position(), 10), std::string_view(s).substr(0, 10));
+        buf->position() += 10;
+    }
+
+    /// Wait for background download to settle, then verify the stored segment
+    /// bytes directly against the source file.
+    {
+        bool all_downloaded = false;
+        for (int attempt = 0; attempt < 200 && !all_downloaded; ++attempt)
+        {
+            auto holder = cache->get(key, 0, s.size(), /* file_segments_limit */ 0, user.user_id);
+            all_downloaded = true;
+            for (const auto & segment : *holder)
+            {
+                if (segment->state() == FileSegment::State::DOWNLOADING
+                    || segment->state() == FileSegment::State::EMPTY
+                    || segment->state() == FileSegment::State::PARTIALLY_DOWNLOADED)
+                    all_downloaded = false;
+            }
+            /// Segments never touched by a reader have no remote reader to
+            /// continue a background download from; they settle as `DETACHED`
+            /// (or are dropped) and are simply re-created on the next read.
+            if (!all_downloaded)
+                std::this_thread::sleep_for(50ms);
+        }
+        ASSERT_TRUE(all_downloaded);
+
+        auto holder = cache->get(key, 0, s.size(), /* file_segments_limit */ 0, user.user_id);
+        for (const auto & segment : *holder)
+        {
+            if (segment->state() != FileSegment::State::DOWNLOADED
+                && segment->state() != FileSegment::State::PARTIALLY_DOWNLOADED)
+                continue;
+            const size_t downloaded = segment->state() == FileSegment::State::DOWNLOADED
+                ? segment->range().size() : segment->getDownloadedSize();
+            if (!downloaded)
+                continue;
+            std::ifstream in(segment->getPath(), std::ios::binary);
+            std::string cached((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            ASSERT_GE(cached.size(), downloaded);
+            ASSERT_EQ(cached.substr(0, downloaded), s.substr(segment->range().left, downloaded))
+                << "segment range " << segment->range().toString();
+        }
+    }
+
+    /// Phase 3: a full read through the cache must return the source bytes.
+    {
+        auto buf = make_cached_buffer();
+        WriteBufferFromOwnString result;
+        copyData(*buf, result);
+        ASSERT_EQ(result.str(), s);
+    }
+
+    /// Phase 5: concurrent readers seeking over the same segments, each
+    /// dropping its buffer in the middle of a segment (handing the download
+    /// over to other readers or to background download). Every byte served
+    /// must match the source file.
+    {
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> threads;
+        for (size_t t = 0; t < 8; ++t)
+        {
+            threads.emplace_back([&, t]()
+            {
+                DB::ThreadStatus thread_status_holder;
+                auto thread_query_context = DB::Context::createCopy(getContext().context);
+                thread_query_context->makeQueryContext();
+                thread_query_context->setCurrentQueryId(query_id + "_" + std::to_string(t));
+                auto thread_query_scope_holder = DB::QueryScope::create(thread_query_context);
+
+                for (size_t i = 0; i < 30 && !failed.load(); ++i)
+                {
+                    auto buf = make_cached_buffer();
+                    const size_t offset = (t * 9973 + i * 7919) % (s.size() - 100);
+                    buf->seek(static_cast<off_t>(offset), SEEK_SET);
+                    size_t read_total = 0;
+                    while (read_total < 5000 && buf->next())
+                    {
+                        const size_t n = std::min(buf->available(), 5000 - read_total);
+                        if (std::string_view(buf->position(), n) != std::string_view(s).substr(offset + read_total, n))
+                        {
+                            failed.store(true);
+                            break;
+                        }
+                        buf->position() += n;
+                        read_total += n;
+                    }
+                    /// Drop the buffer wherever it stopped.
+                }
+            });
+        }
+        for (auto & thread : threads)
+            thread.join();
+        ASSERT_FALSE(failed.load());
+    }
+
+    /// Phase 4: random seeks must return the source bytes at those offsets, both on a
+    /// fresh buffer and when seeking multiple times on the same buffer after partial reads
+    /// (`MergeTreeReaderCompactSingleBuffer` seeks across column stripes on one buffer).
+    auto shared_seek_buf = make_cached_buffer();
+    for (size_t offset : {0, 1, 9999, 10000, 10001, 25055, 25080, 50000, 99999})
+    {
+        for (auto & buf : {make_cached_buffer(), shared_seek_buf})
+        {
+            buf->seek(static_cast<off_t>(offset), SEEK_SET);
+            ASSERT_EQ(static_cast<size_t>(buf->getPosition()), offset);
+            if (offset == s.size() - 1)
+            {
+                std::string got(1, '\0');
+                buf->readStrict(got.data(), 1);
+                ASSERT_EQ(got[0], s[offset]);
+            }
+            else
+            {
+                const size_t n = std::min(15uz, s.size() - offset);
+                std::string got(n, '\0');
+                buf->readStrict(got.data(), n);
+                ASSERT_EQ(got, s.substr(offset, n)) << "offset " << offset;
+            }
+        }
+    }
+
+    /// `setReadUntilPosition` after a partial read on the same buffer must discard
+    /// buffered bytes past the current position instead of shifting `getPosition()`
+    /// or serving leftover working-buffer bytes on the next read.
+    {
+        auto buf = make_cached_buffer();
+        buf->seek(100, SEEK_SET);
+        std::string first_part(10, '\0');
+        buf->readStrict(first_part.data(), 10);
+        ASSERT_EQ(first_part, s.substr(100, 10));
+        ASSERT_EQ(static_cast<size_t>(buf->getPosition()), 110uz);
+
+        buf->setReadUntilPosition(130);
+        ASSERT_EQ(static_cast<size_t>(buf->getPosition()), 110uz);
+        std::string rest;
+        {
+            WriteBufferFromString wb(rest);
+            copyData(*buf, wb);
+        }
+        ASSERT_EQ(rest, s.substr(110, 20));
+    }
+
+    /// Phase 6: the shape seen with a local disk under the cache in production:
+    /// background download disabled (segments are completed synchronously by
+    /// the next reader), a tiny impl buffer (the reader forwards the mark
+    /// range size as `read_hint`, shrinking the impl), and readers that die in
+    /// the middle of a segment download, handing the segment over to the next
+    /// reader. Served and stored bytes must stay byte-exact: a takeover that
+    /// continues from a reader positioned past the segment write offset would
+    /// splice wrong-offset bytes into the segment.
+    {
+        std::string s2;
+        s2.resize(100000);
+        for (size_t i = 0; i < s2.size(); ++i)
+            s2[i] = static_cast<char>((i * 17 + 3) % 241);
+
+        std::string file_path2 = fs::current_path() / "test_local_bg2";
+        {
+            auto wb = std::make_unique<WriteBufferFromFile>(file_path2, DBMS_DEFAULT_BUFFER_SIZE);
+            wb->write(s2.data(), s2.size());
+            wb->next();
+            wb->finalize();
+        }
+
+        ReadSettings tiny_read_settings = read_settings;
+        tiny_read_settings.local_fs_settings.buffer_size = 64;
+        tiny_read_settings.filesystem_cache_settings.allow_background_download = false;
+        tiny_read_settings.filesystem_cache_settings.allow_background_download_during_fetch = false;
+
+        auto tiny_read_buffer_creator = [&]()
+        {
+            return createReadBufferFromFileBase(file_path2, tiny_read_settings, /* read_hint */ 60, /* file_size */ s2.size());
+        };
+
+        auto key2 = DB::FileCacheKey::fromPath(file_path2);
+        auto make_tiny_cached_buffer = [&]()
+        {
+            return std::make_shared<CachedOnDiskReadBufferFromFile>(
+                file_path2, key2, cache, user, tiny_read_buffer_creator,
+                tiny_read_settings.filesystem_cache_settings,
+                /* remote_fs_buffer_size */ 64, /* local_fs_buffer_size */ 64,
+                query_id, s2.size(),
+                /* allow_seeks_after_first_read */ true,
+                /* use_external_buffer */ false,
+                std::nullopt, nullptr);
+        };
+
+        auto read_slice_and_verify = [&](size_t offset, size_t length)
+        {
+            auto buf = make_tiny_cached_buffer();
+            buf->seek(static_cast<off_t>(offset), SEEK_SET);
+            size_t read_total = 0;
+            while (read_total < length && buf->next())
+            {
+                const size_t n = std::min(buf->available(), length - read_total);
+                ASSERT_EQ(std::string_view(buf->position(), n), std::string_view(s2).substr(offset + read_total, n))
+                    << "offset " << offset + read_total;
+                buf->position() += n;
+                read_total += n;
+            }
+            ASSERT_EQ(read_total, length);
+        };
+
+        /// Short-lived readers dying mid-download, interleaved with verifiers.
+        for (size_t i = 0; i < 40; ++i)
+        {
+            const size_t offset = (i * 7919) % (s2.size() - 100);
+            {
+                auto buf = make_tiny_cached_buffer();
+                buf->seek(static_cast<off_t>(offset), SEEK_SET);
+                ASSERT_TRUE(buf->next());
+                const size_t n = std::min(buf->available(), 37uz);
+                ASSERT_EQ(std::string_view(buf->position(), n), std::string_view(s2).substr(offset, n));
+                /// Drop the buffer in the middle of the segment download.
+            }
+            if (i % 5 == 4)
+                read_slice_and_verify((i * 104729) % (s2.size() - 2000), 2000);
+        }
+
+        /// A full read through the cache must return the source bytes.
+        {
+            auto buf = make_tiny_cached_buffer();
+            WriteBufferFromOwnString result;
+            copyData(*buf, result);
+            ASSERT_EQ(result.str(), s2);
+        }
+
+        /// The stored segment bytes must equal the source bytes.
+        auto holder = cache->get(key2, 0, s2.size(), /* file_segments_limit */ 0, user.user_id);
+        for (const auto & segment : *holder)
+        {
+            if (segment->state() != FileSegment::State::DOWNLOADED
+                && segment->state() != FileSegment::State::PARTIALLY_DOWNLOADED)
+                continue;
+            const size_t downloaded = segment->state() == FileSegment::State::DOWNLOADED
+                ? segment->range().size() : segment->getDownloadedSize();
+            if (!downloaded)
+                continue;
+            std::ifstream in(segment->getPath(), std::ios::binary);
+            std::string cached((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            ASSERT_GE(cached.size(), downloaded);
+            ASSERT_EQ(cached.substr(0, downloaded), s2.substr(segment->range().left, downloaded))
+                << "segment range " << segment->range().toString();
+        }
     }
 }
 
@@ -3804,6 +4152,125 @@ TEST_F(FileCacheTest, SLRUDowngradeRollbackResetsEvictingOnSkippedFinalization)
         EXPECT_NE(it->getEntry()->getState(), IFileCachePriority::Entry::State::Evicting)
             << "A protected entry was left stuck in Evicting after a skipped downgrade finalization";
     }
+
+    {
+        auto lock = state_guard.lock();
+        ASSERT_EQ(priority.getElementsCount(lock), 3);
+        ASSERT_EQ(priority.getProtectedElementsCount(lock), 3);
+        ASSERT_NO_THROW(priority.check(lock));
+        /// Regression: poisoned counters used to make the next hold fail with
+        /// `Cannot take space` even though protected still had headroom.
+        ASSERT_NO_THROW(priority.collectEvictionInfo(
+            /* size */ 5, /* elements */ 0, reservee.get(),
+            /* is_total_space_cleanup */ false, origin, lock));
+    }
+}
+
+TEST_F(FileCacheTest, SLRUDowngradeAbortedByFailpointPreservesAccounting)
+{
+    /// `file_cache_slru_downgrade_fail_before_finalize` throws in the protected-downgrade
+    /// state-finalization step (after `afterEvictWrite`). Rollback must keep queue accounting
+    /// consistent so a subsequent reserve/hold does not hit poisoned counters.
+    ServerUUID::setRandomForUnitTests();
+
+    const size_t max_size = 30;
+    const size_t max_elements = 6;
+    const double slru_size_ratio = 0.5;
+    SLRUFileCachePriority priority(IFileCachePriority::QueueType::Main, max_size, max_elements, slru_size_ratio, "test_slru_downgrade_failpoint");
+
+    const std::string cache_path = caches_dir / "test_slru_downgrade_failpoint";
+    fs::create_directories(cache_path);
+    CacheMetadata cache_metadata(cache_path, 0, 0, false, false);
+
+    const auto key = DB::FileCacheKey::fromPath("slru_downgrade_failpoint_key");
+    const auto & origin = FileCache::getCommonOrigin();
+    auto key_metadata = std::make_shared<KeyMetadata>(key, std::make_shared<const FileCacheOriginInfo>(origin), &cache_metadata);
+
+    CacheStateGuard state_guard;
+
+    auto add_protected_segment = [&](size_t offset, size_t size)
+    {
+        IFileCachePriority::IteratorPtr it;
+        {
+            auto state_lock = state_guard.lock();
+            auto lock = priority.getPriorityGuardForTests().writeLock();
+            it = priority.addForRestore(key_metadata, offset, size,
+                IFileCachePriority::QueueEntryType::SLRU_Protected, lock, &state_lock);
+        }
+        const auto path = cache_metadata.getFileSegmentPath(key, offset, FileSegmentKind::Regular, origin);
+        if (fs::exists(path))
+            fs::remove(path);
+        fs::create_directories(fs::path(path).parent_path());
+        WriteBufferFromFile wb(path, DBMS_DEFAULT_BUFFER_SIZE, O_APPEND | O_CREAT | O_WRONLY);
+        DB::writeString(std::string(size, '0'), wb);
+        wb.finalize();
+        auto file_segment = std::make_shared<FileSegment>(
+            key, offset, size, FileSegment::State::DOWNLOADED,
+            CreateFileSegmentSettings{}, false, nullptr, key_metadata, it);
+        LockedKey(key_metadata).emplace(offset, std::make_shared<FileSegmentMetadata>(std::move(file_segment)));
+        return it;
+    };
+
+    add_protected_segment(0, 5);
+    add_protected_segment(5, 5);
+  auto reservee = add_protected_segment(10, 5);
+    ASSERT_EQ(priority.getProtectedSize(state_guard.lock()), 15);
+
+    FailPointInjection::enableFailPoint("file_cache_slru_downgrade_fail_before_finalize");
+    SCOPE_EXIT({ FailPointInjection::disableFailPoint("file_cache_slru_downgrade_fail_before_finalize"); });
+
+    for (size_t attempt = 0; attempt < 25; ++attempt)
+    {
+        EvictionInfoPtr eviction_info = priority.collectEvictionInfo(
+            /* size */ 5, /* elements */ 0, reservee.get(),
+            /* is_total_space_cleanup */ false, origin, state_guard.lock());
+        ASSERT_TRUE(eviction_info->requiresEviction());
+
+        FileCacheReserveStat stat;
+        auto evicted = std::make_unique<EvictionCandidates>(IFileCachePriority::OnEvictCallback{});
+        ASSERT_TRUE(priority.collectCandidatesForEviction(
+            *eviction_info, stat, *evicted, reservee,
+            IFileCachePriority::EvictionCursor::FromHead, /* max_candidates_size */ 0,
+            /* is_total_space_cleanup */ false, origin, state_guard));
+
+        evicted->afterEvictWrite();
+        ASSERT_THROW(
+            {
+                auto lock = state_guard.lock();
+                evicted->afterEvictState(lock);
+            },
+            Exception);
+        eviction_info.reset();
+        evicted.reset();
+
+        auto lock = state_guard.lock();
+        ASSERT_EQ(priority.getElementsCount(lock), 3);
+        ASSERT_EQ(priority.getProtectedElementsCount(lock), 3);
+        ASSERT_NO_THROW(priority.check(lock));
+        ASSERT_NO_THROW(priority.collectEvictionInfo(
+            /* size */ 5, /* elements */ 0, reservee.get(),
+            /* is_total_space_cleanup */ false, origin, lock));
+    }
+
+    FailPointInjection::disableFailPoint("file_cache_slru_downgrade_fail_before_finalize");
+    {
+        EvictionInfoPtr eviction_info = priority.collectEvictionInfo(
+            /* size */ 5, /* elements */ 0, reservee.get(),
+            /* is_total_space_cleanup */ false, origin, state_guard.lock());
+
+        FileCacheReserveStat stat;
+        auto evicted = std::make_unique<EvictionCandidates>(IFileCachePriority::OnEvictCallback{});
+        priority.collectCandidatesForEviction(
+            *eviction_info, stat, *evicted, reservee,
+            IFileCachePriority::EvictionCursor::FromHead, 0, false, origin, state_guard);
+        evicted->afterEvictWrite();
+        auto lock = state_guard.lock();
+        eviction_info->releaseHoldSpace(lock);
+        evicted->afterEvictState(lock);
+    }
+    auto lock = state_guard.lock();
+    ASSERT_EQ(priority.getElementsCount(lock), 3);
+    ASSERT_NO_THROW(priority.check(lock));
 }
 
 TEST_F(FileCacheTest, SLRUCollectForProtectedQueueWithoutReservee)

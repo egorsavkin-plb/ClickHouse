@@ -132,6 +132,10 @@ struct FilesystemCacheSettings
     /// How long a read may wait for a file segment which is being downloaded by a concurrent query
     /// before bypassing the cache and reading directly from remote storage.
     size_t wait_for_concurrent_download_timeout_milliseconds = 1000;
+    /// Drop the source file's page-cache pages behind reads that duplicate them into the
+    /// filesystem cache (a local cache disk on top of another local disk keeps the same bytes
+    /// in RAM twice otherwise). Best-effort, Linux only, no-op for non-local sources.
+    bool drop_source_page_cache = false;
     bool enable_log = false;
     bool verbose_logging = false;
 };

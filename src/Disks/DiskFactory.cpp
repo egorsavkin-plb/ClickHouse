@@ -4,6 +4,7 @@
 #include <Common/Config/ConfigurationWithUsageTracking.h>
 #include <Common/ProxyConfigurationResolverProvider.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/FileCache/FileCacheSettings.h>
 
 #include <fmt/ranges.h>
 
@@ -192,6 +193,9 @@ std::shared_ptr<const ConfigurationWithUsageTracking> DiskFactory::trackImplicit
     tracked_config->markAsUsed(config_prefix + ".type");
     tracked_config->markAsUsed(config_prefix + ".skip_access_check");
     tracked_config->markAsUsed(config_prefix + ".thread_pool_size");
+    /// The nested filesystem-cache section that the creation of a `local` disk reads, see `registerDiskLocal`.
+    for (const auto & column : FileCacheSettings::getColumnsDescription())
+        tracked_config->markAsUsed(config_prefix + ".filesystem_cache." + column.name);
 
     return tracked_config;
 }

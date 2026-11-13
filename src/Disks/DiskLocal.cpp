@@ -137,6 +137,15 @@ private:
 /// Drops any cached entry for the file's inode on cancel (or if a write fails after
 /// partial write-through caching), so an aborted write leaves no partial or stale
 /// segments under that inode key.
+///
+/// When `source_fd` is valid, also releases this disk's page-cache pages behind the
+/// write: the same bytes are being written through to the filesystem cache, so keeping
+/// the source file's pages in RAM as well double-caches them. `POSIX_FADV_DONTNEED`
+/// does not drop dirty pages, so the file is written back in a rolling window:
+/// kick async writeback on the window just completed, wait for and drop the previous
+/// one, and flush the tail after the final `preFinalize`/`sync`. Stops advising if
+/// write-through caching stopped mid-write (then the source's pages are the only
+/// cached copy left). Linux only, best-effort.
 class WriteThroughCacheCleanupBuffer final : public WriteBufferFromFileDecorator
 {
 public:
@@ -144,11 +153,13 @@ public:
         std::unique_ptr<WriteBufferFromFileBase> impl_,
         FileCachePtr cache_,
         FileCacheKey key_,
-        FileCache::UserID user_id_)
+        FileCache::UserID user_id_,
+        int source_fd_)
         : WriteBufferFromFileDecorator(std::move(impl_))
         , cache(std::move(cache_))
         , key(key_)
         , user_id(std::move(user_id_))
+        , source_fd(source_fd_)
     {
     }
 
@@ -161,6 +172,7 @@ public:
         /// `WriteBufferFromFile` without going through `CachedOnDiskWriteBufferFromFile::nextImpl`.
         next();
         WriteBufferFromFileDecorator::preFinalize();
+        dropSourcePageCacheFinal();
     }
 
     void sync() override
@@ -168,8 +180,11 @@ public:
         /// Flush through `CachedOnDiskWriteBufferFromFile::nextImpl` first, then `fsync`
         /// the underlying file descriptor.
         next();
-        SwapHelper swap(*this, *impl);
-        impl->sync();
+        {
+            SwapHelper swap(*this, *impl);
+            impl->sync();
+        }
+        dropSourcePageCacheFinal();
     }
 
 protected:
@@ -187,9 +202,71 @@ protected:
     }
 
 private:
+    void nextImpl() override
+    {
+        {
+            SwapHelper swap(*this, *impl);
+            impl->next();
+        }
+        dropSourcePageCacheBehind();
+    }
+
+    /// `[[maybe_unused]]`: referenced only from the Linux-only page-cache drop below.
+    [[maybe_unused]] bool writeThroughCachingStopped() const
+    {
+        const auto * cache_buf = dynamic_cast<const IFilesystemCacheWriteBuffer *>(impl.get());
+        return !cache_buf || cache_buf->cachingStopped();
+    }
+
+#if defined(__linux__) && defined(POSIX_FADV_DONTNEED)
+    /// Write back and drop everything in [dropped_upto, upto).
+    void writeBackAndDrop(off_t upto)
+    {
+        if (upto <= dropped_upto)
+            return;
+        ::sync_file_range(source_fd, dropped_upto, upto - dropped_upto,
+            SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+        ::posix_fadvise(source_fd, dropped_upto, upto - dropped_upto, POSIX_FADV_DONTNEED);
+        dropped_upto = upto;
+    }
+
+    void dropSourcePageCacheBehind()
+    {
+        if (source_fd < 0 || writeThroughCachingStopped())
+            return;
+
+        const off_t written = static_cast<off_t>(count());
+        while (written >= next_drop_boundary)
+        {
+            /// Kick writeback on the window just completed (async), then wait for and
+            /// drop everything before it — it has had a full window of time to write back.
+            ::sync_file_range(source_fd, next_drop_boundary - drop_window_size, drop_window_size, SYNC_FILE_RANGE_WRITE);
+            writeBackAndDrop(next_drop_boundary - drop_window_size);
+            next_drop_boundary += drop_window_size;
+        }
+    }
+
+    void dropSourcePageCacheFinal()
+    {
+        if (source_fd < 0 || writeThroughCachingStopped())
+            return;
+        writeBackAndDrop(static_cast<off_t>(count()));
+    }
+
+    static constexpr off_t drop_window_size = 8 * 1024 * 1024;
+    off_t next_drop_boundary = drop_window_size;
+    off_t dropped_upto = 0;
+#else
+    void dropSourcePageCacheBehind() {}
+    void dropSourcePageCacheFinal() {}
+#endif
+
     FileCachePtr cache;
     FileCacheKey key;
     FileCache::UserID user_id;
+    /// fd of the underlying local file; -1 disables page-cache dropping.
+    /// `[[maybe_unused]]`: read only from the Linux-only page-cache drop above.
+    [[maybe_unused]] int source_fd;
 };
 
 bool errnoIndicatesReadOnlyDisk(int err)
@@ -645,6 +722,11 @@ void DiskLocal::prepareRead(
         cached_settings.filesystem_cache_settings.allow_background_download = false;
         cached_settings.filesystem_cache_settings.allow_background_download_during_fetch = false;
 
+        /// The filesystem cache replaces the RAM page cache for this disk: drop the
+        /// source file's pages behind reads that duplicate them into the cache.
+        cached_settings.filesystem_cache_settings.drop_source_page_cache
+            = drop_page_cache_when_filesystem_cache_enabled;
+
         pipeline.setLocalFileSource(
             full_path.string(),
             StoredObjects{obj},
@@ -763,6 +845,8 @@ DiskLocal::writeFile(const String & path, size_t buf_size, WriteMode mode, const
                 ? std::string(CurrentThread::getQueryId())
                 : "";
 
+            const int source_fd = buffer->getFD();
+
             auto cached_writer = std::make_unique<CachedOnDiskWriteBufferFromFile>(
                 std::move(buffer),
                 filesystem_cache,
@@ -775,7 +859,8 @@ DiskLocal::writeFile(const String & path, size_t buf_size, WriteMode mode, const
                 /* is_distributed_cache */ false);
 
             return std::make_unique<WriteThroughCacheCleanupBuffer>(
-                std::move(cached_writer), filesystem_cache, key, origin.user_id);
+                std::move(cached_writer), filesystem_cache, key, origin.user_id,
+                drop_page_cache_when_filesystem_cache_enabled ? source_fd : -1);
         }
     }
 
@@ -982,6 +1067,9 @@ void DiskLocal::applyNewSettings(const Poco::Util::AbstractConfiguration & confi
     if (keep_free_space_bytes != new_keep_free_space_bytes)
         keep_free_space_bytes = new_keep_free_space_bytes;
 
+    drop_page_cache_when_filesystem_cache_enabled
+        = config.getBool(config_prefix + ".drop_page_cache_when_filesystem_cache_enabled", true);
+
     IDisk::applyNewSettings(config, context, config_prefix, disk_map);
 }
 
@@ -992,6 +1080,8 @@ DiskLocal::DiskLocal(const String & name_, const String & path_, UInt64 keep_fre
     , disk_path(path_)
     , filesystem_cache(std::move(filesystem_cache_))
     , filesystem_cache_name(std::move(filesystem_cache_name_))
+    , drop_page_cache_when_filesystem_cache_enabled(
+          config.getBool(config_prefix + ".drop_page_cache_when_filesystem_cache_enabled", true))
     , keep_free_space_bytes(keep_free_space_bytes_)
     , logger(getLogger("DiskLocal"))
     , data_source_description(getLocalDataSourceDescription(disk_path))

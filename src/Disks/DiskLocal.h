@@ -207,6 +207,10 @@ private:
     const String disk_path;
     FileCachePtr filesystem_cache;
     String filesystem_cache_name;
+    /// When the filesystem cache is active, release this disk's own page-cache pages
+    /// behind reads/writes whose bytes are (being) duplicated into the cache, so the
+    /// same data is not kept in RAM twice. Linux only, best-effort.
+    bool drop_page_cache_when_filesystem_cache_enabled = true;
     std::atomic<UInt64> keep_free_space_bytes;
     LoggerPtr logger;
     DataSourceDescription data_source_description;

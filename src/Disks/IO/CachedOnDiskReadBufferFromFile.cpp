@@ -8,6 +8,7 @@
 #include <Interpreters/FileCache/FileCache.h>
 #include <IO/BoundedReadBuffer.h>
 #include <IO/ReadBufferFromFile.h>
+#include <IO/ReadBufferFromFileDecorator.h>
 #include <IO/ReadBufferFromS3.h>
 #include <Common/Scheduler/CurrentCPULease.h>
 #include <IO/IReadBufferMetadataProvider.h>
@@ -68,6 +69,46 @@ namespace
         "(eviction, expiry, writer failure or server restart). "
         "The query has to be retried",
         offset, end_offset, key);
+}
+
+#if defined(POSIX_FADV_DONTNEED)
+/// The fd of the innermost descriptor-based reader, or -1 for non-fd buffers
+/// (object storage), where page-cache hygiene does not apply.
+int getLocalFD(const ReadBufferFromFileBase * buf)
+{
+    while (buf)
+    {
+        if (const auto * fd_buf = dynamic_cast<const ReadBufferFromFileDescriptor *>(buf))
+            return fd_buf->getFD();
+        if (const auto * decorator = dynamic_cast<const ReadBufferFromFileDecorator *>(buf))
+        {
+            buf = dynamic_cast<const ReadBufferFromFileBase *>(&decorator->getWrappedReadBuffer());
+            continue;
+        }
+        break;
+    }
+    return -1;
+}
+#endif
+
+/// Best-effort: drop the source file's page-cache pages for [offset, offset + size).
+/// On a cache disk these bytes are (being) duplicated into the filesystem cache,
+/// so keeping the source's pages in RAM as well double-caches the same data.
+void dropSourcePageCache(
+    [[maybe_unused]] const ReadBufferFromFileBase * buf,
+    [[maybe_unused]] size_t offset,
+    [[maybe_unused]] size_t size)
+{
+#if defined(POSIX_FADV_DONTNEED)
+    const int fd = getLocalFD(buf);
+    if (fd < 0)
+        return;
+
+    constexpr size_t page_size = 4096;
+    const off_t aligned_begin = static_cast<off_t>(offset / page_size * page_size);
+    const off_t aligned_end = static_cast<off_t>((offset + size + page_size - 1) / page_size * page_size);
+    ::posix_fadvise(fd, aligned_begin, aligned_end - aligned_begin, POSIX_FADV_DONTNEED);
+#endif
 }
 
 }
@@ -1652,6 +1693,9 @@ size_t CachedOnDiskReadBufferFromFile::readFromFileSegment(
     {
         chassert(state.buf->available());
         bool download_current_segment_succeeded = false;
+        /// Whether this read went to the source bypassing the cache from the start
+        /// (as opposed to a download that failed below and flipped to bypass).
+        const bool bypassed_cache = state.read_type == ReadType::REMOTE_FS_READ_BYPASS_CACHE;
         if (do_download)
         {
             chassert(
@@ -1729,6 +1773,14 @@ size_t CachedOnDiskReadBufferFromFile::readFromFileSegment(
 
         if (do_download && download_current_segment_succeeded)
             chassert(file_segment.getCurrentWriteOffset() >= offset + size);
+
+        /// The bytes just read from the source are (being) duplicated into the filesystem
+        /// cache: release the source's page-cache copy so the same bytes do not occupy RAM
+        /// twice. Skipped when a cache write failed mid-segment — then the source's pages
+        /// are the only cached copy left.
+        if (info.cache_settings.drop_source_page_cache
+            && (bypassed_cache || download_current_segment_succeeded))
+            dropSourcePageCache(state.buf.get(), offset, size);
 
         chassert(
             offset + size <= info.read_until_position,
@@ -2053,6 +2105,62 @@ size_t CachedOnDiskReadBufferFromFile::readBigAt(
     }
 
     return read_bytes;
+}
+
+void CachedOnDiskReadBufferFromFile::prefetch(Priority priority)
+{
+    /// Prefetch is only an I/O hint (`POSIX_FADV_WILLNEED` underneath); it must never fail a query.
+    try
+    {
+        /// A read is in progress: advise on the buffer that will serve the next bytes
+        /// (the NVMe cache segment file on a cache hit, the source file on a miss).
+        if (state && state->buf)
+        {
+            state->buf->prefetch(priority);
+            return;
+        }
+
+        if (info.cache_file_reader)
+        {
+            info.cache_file_reader->prefetch(priority);
+            return;
+        }
+
+        /// Typical case: prefetch after a seek, before the first read (e.g. MergeTree wide
+        /// reader prefetching all column streams at the first mark of a range). No read state
+        /// exists yet, so resolve the file segment covering the current offset read-only:
+        /// `FileCache::get` never creates segments and we never become a downloader here.
+        if (file_offset_of_buffer_end >= info.read_until_position)
+            return;
+
+        auto holder = cache->get(
+            info.cache_key,
+            file_offset_of_buffer_end,
+            /* size */ 1,
+            /* file_segments_limit */ 1,
+            origin.user_id);
+
+        if (!holder || holder->empty())
+            return;
+
+        auto & file_segment = holder->front();
+
+        /// Advise only if the bytes at the current offset are already on the cache disk;
+        /// for a still-downloading prefix the upcoming read will fault them in anyway.
+        if (!canStartFromCache(file_offset_of_buffer_end, file_segment))
+            return;
+
+        auto buf = getCacheReadBuffer(file_segment, info);
+        if (!buf)
+            return;
+
+        buf->seek(file_offset_of_buffer_end - file_segment.range().left, SEEK_SET);
+        buf->prefetch(priority);
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, "prefetch");
+    }
 }
 
 off_t CachedOnDiskReadBufferFromFile::seek(off_t offset, int whence)

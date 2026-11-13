@@ -104,6 +104,7 @@ namespace DB::ErrorCodes
 {
     extern const int FILECACHE_ACCESS_DENIED;
     extern const int CANNOT_READ_ALL_DATA;
+    extern const int FAULT_INJECTED;
 }
 namespace DB::FileCacheSetting
 {
@@ -4151,6 +4152,125 @@ TEST_F(FileCacheTest, SLRUDowngradeRollbackResetsEvictingOnSkippedFinalization)
         EXPECT_NE(it->getEntry()->getState(), IFileCachePriority::Entry::State::Evicting)
             << "A protected entry was left stuck in Evicting after a skipped downgrade finalization";
     }
+
+    {
+        auto lock = state_guard.lock();
+        ASSERT_EQ(priority.getElementsCount(lock), 3);
+        ASSERT_EQ(priority.getProtectedElementsCount(lock), 3);
+        ASSERT_NO_THROW(priority.check(lock));
+        /// Regression: poisoned counters used to make the next hold fail with
+        /// `Cannot take space` even though protected still had headroom.
+        ASSERT_NO_THROW(priority.collectEvictionInfo(
+            /* size */ 5, /* elements */ 0, reservee.get(),
+            /* is_total_space_cleanup */ false, origin, lock));
+    }
+}
+
+TEST_F(FileCacheTest, SLRUDowngradeAbortedByFailpointPreservesAccounting)
+{
+    /// `file_cache_slru_downgrade_fail_before_finalize` throws in the protected-downgrade
+    /// state-finalization step (after `afterEvictWrite`). Rollback must keep queue accounting
+    /// consistent so a subsequent reserve/hold does not hit poisoned counters.
+    ServerUUID::setRandomForUnitTests();
+
+    const size_t max_size = 30;
+    const size_t max_elements = 6;
+    const double slru_size_ratio = 0.5;
+    SLRUFileCachePriority priority(IFileCachePriority::QueueType::Main, max_size, max_elements, slru_size_ratio, "test_slru_downgrade_failpoint");
+
+    const std::string cache_path = caches_dir / "test_slru_downgrade_failpoint";
+    fs::create_directories(cache_path);
+    CacheMetadata cache_metadata(cache_path, 0, 0, false, false);
+
+    const auto key = DB::FileCacheKey::fromPath("slru_downgrade_failpoint_key");
+    const auto & origin = FileCache::getCommonOrigin();
+    auto key_metadata = std::make_shared<KeyMetadata>(key, std::make_shared<const FileCacheOriginInfo>(origin), &cache_metadata);
+
+    CacheStateGuard state_guard;
+
+    auto add_protected_segment = [&](size_t offset, size_t size)
+    {
+        IFileCachePriority::IteratorPtr it;
+        {
+            auto state_lock = state_guard.lock();
+            auto lock = priority.getPriorityGuardForTests().writeLock();
+            it = priority.addForRestore(key_metadata, offset, size,
+                IFileCachePriority::QueueEntryType::SLRU_Protected, lock, &state_lock);
+        }
+        const auto path = cache_metadata.getFileSegmentPath(key, offset, FileSegmentKind::Regular, origin);
+        if (fs::exists(path))
+            fs::remove(path);
+        fs::create_directories(fs::path(path).parent_path());
+        WriteBufferFromFile wb(path, DBMS_DEFAULT_BUFFER_SIZE, O_APPEND | O_CREAT | O_WRONLY);
+        DB::writeString(std::string(size, '0'), wb);
+        wb.finalize();
+        auto file_segment = std::make_shared<FileSegment>(
+            key, offset, size, FileSegment::State::DOWNLOADED,
+            CreateFileSegmentSettings{}, false, nullptr, key_metadata, it);
+        LockedKey(key_metadata).emplace(offset, std::make_shared<FileSegmentMetadata>(std::move(file_segment)));
+        return it;
+    };
+
+    add_protected_segment(0, 5);
+    add_protected_segment(5, 5);
+  auto reservee = add_protected_segment(10, 5);
+    ASSERT_EQ(priority.getProtectedSize(state_guard.lock()), 15);
+
+    FailPointInjection::enableFailPoint("file_cache_slru_downgrade_fail_before_finalize");
+    SCOPE_EXIT({ FailPointInjection::disableFailPoint("file_cache_slru_downgrade_fail_before_finalize"); });
+
+    for (size_t attempt = 0; attempt < 25; ++attempt)
+    {
+        EvictionInfoPtr eviction_info = priority.collectEvictionInfo(
+            /* size */ 5, /* elements */ 0, reservee.get(),
+            /* is_total_space_cleanup */ false, origin, state_guard.lock());
+        ASSERT_TRUE(eviction_info->requiresEviction());
+
+        FileCacheReserveStat stat;
+        auto evicted = std::make_unique<EvictionCandidates>(IFileCachePriority::OnEvictCallback{});
+        ASSERT_TRUE(priority.collectCandidatesForEviction(
+            *eviction_info, stat, *evicted, reservee,
+            IFileCachePriority::EvictionCursor::FromHead, /* max_candidates_size */ 0,
+            /* is_total_space_cleanup */ false, origin, state_guard));
+
+        evicted->afterEvictWrite();
+        ASSERT_THROW(
+            {
+                auto lock = state_guard.lock();
+                evicted->afterEvictState(lock);
+            },
+            Exception);
+        eviction_info.reset();
+        evicted.reset();
+
+        auto lock = state_guard.lock();
+        ASSERT_EQ(priority.getElementsCount(lock), 3);
+        ASSERT_EQ(priority.getProtectedElementsCount(lock), 3);
+        ASSERT_NO_THROW(priority.check(lock));
+        ASSERT_NO_THROW(priority.collectEvictionInfo(
+            /* size */ 5, /* elements */ 0, reservee.get(),
+            /* is_total_space_cleanup */ false, origin, lock));
+    }
+
+    FailPointInjection::disableFailPoint("file_cache_slru_downgrade_fail_before_finalize");
+    {
+        EvictionInfoPtr eviction_info = priority.collectEvictionInfo(
+            /* size */ 5, /* elements */ 0, reservee.get(),
+            /* is_total_space_cleanup */ false, origin, state_guard.lock());
+
+        FileCacheReserveStat stat;
+        auto evicted = std::make_unique<EvictionCandidates>(IFileCachePriority::OnEvictCallback{});
+        priority.collectCandidatesForEviction(
+            *eviction_info, stat, *evicted, reservee,
+            IFileCachePriority::EvictionCursor::FromHead, 0, false, origin, state_guard);
+        evicted->afterEvictWrite();
+        auto lock = state_guard.lock();
+        eviction_info->releaseHoldSpace(lock);
+        evicted->afterEvictState(lock);
+    }
+    auto lock = state_guard.lock();
+    ASSERT_EQ(priority.getElementsCount(lock), 3);
+    ASSERT_NO_THROW(priority.check(lock));
 }
 
 TEST_F(FileCacheTest, SLRUCollectForProtectedQueueWithoutReservee)

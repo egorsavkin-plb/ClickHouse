@@ -5,7 +5,6 @@
 #include <base/scope_guard.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
-#include <Common/thread_local_rng.h>
 #include <Common/logger_useful.h>
 #include <Common/assert_cast.h>
 #include <Common/FailPoint.h>
@@ -513,7 +512,8 @@ bool SLRUFileCachePriority::collectCandidatesForEvictionInProtected(
             /// Invalidate the new probationary `PreActive` entry, and
             /// reset the old protected entry's `Evicting` flag back to `Active`.
             new_nested_iterator.invalidate();
-            prev_entry->resetFlag(Entry::State::Evicting);
+            if (prev_entry->getState() == Entry::State::Evicting)
+                prev_entry->resetFlag(Entry::State::Evicting);
             rollbacked = true;
         }
     };
@@ -586,10 +586,8 @@ bool SLRUFileCachePriority::collectCandidatesForEvictionInProtected(
     {
         fiu_do_on(FailPoints::file_cache_slru_downgrade_fail_before_finalize,
         {
-            static constexpr double fault_probability = 0.001;
-            if (std::bernoulli_distribution(fault_probability)(thread_local_rng))
-                throw Exception(ErrorCodes::FAULT_INJECTED,
-                                "Injected fault before SLRU downgrade finalization");
+            throw Exception(ErrorCodes::FAULT_INJECTED,
+                            "Injected fault before SLRU downgrade finalization");
         });
 
         chassert(downgraded_entries->getSize() > 0);

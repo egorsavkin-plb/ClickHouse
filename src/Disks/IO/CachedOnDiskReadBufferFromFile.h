@@ -51,6 +51,8 @@ public:
 
     bool nextImpl() override;
 
+    void prefetch(Priority priority) override;
+
     off_t seek(off_t off, int whence) override;
 
     off_t getPosition() override;

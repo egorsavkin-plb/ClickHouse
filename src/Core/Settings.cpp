@@ -8748,7 +8748,7 @@ If you read various articles about 'io_uring' on the Internet, don't be blinded 
     DECLARE(String, remote_filesystem_read_method, "threadpool", R"(
 Method of reading data from remote filesystem, one of: read, threadpool.
 )", 0) \
-    DECLARE(Bool, local_filesystem_read_prefetch, false, R"(
+    DECLARE(Bool, local_filesystem_read_prefetch, true, R"(
 Should use prefetching when reading data from local filesystem.
 )", 0) \
     DECLARE(Bool, remote_filesystem_read_prefetch, true, R"(

@@ -5,7 +5,11 @@
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/WriteBufferFromFile.h>
+#include <Interpreters/FileCache/FileCache_fwd.h>
+#include <Interpreters/FileCache/FileCacheKey.h>
 #include <Poco/Util/AbstractConfiguration.h>
+
+#include <sys/stat.h>
 
 
 namespace DB
@@ -20,7 +24,8 @@ public:
     friend class DiskLocalReservation;
 
     DiskLocal(const String & name_, const String & path_, UInt64 keep_free_space_bytes_,
-              const Poco::Util::AbstractConfiguration & config, const String & config_prefix);
+              const Poco::Util::AbstractConfiguration & config, const String & config_prefix,
+              FileCachePtr filesystem_cache_ = nullptr, String filesystem_cache_name_ = {});
 
     DiskLocal(
         const String & name_,
@@ -28,7 +33,8 @@ public:
         UInt64 keep_free_space_bytes_,
         ContextPtr context,
         const Poco::Util::AbstractConfiguration & config,
-        const String & config_prefix);
+        const String & config_prefix,
+        FileCachePtr filesystem_cache_ = nullptr, String filesystem_cache_name_ = {});
 
     DiskLocal(const String & name_, const String & path_);
 
@@ -136,6 +142,17 @@ public:
 
     bool supportZeroCopyReplication() const override { return false; }
 
+    bool supportsCache() const override { return filesystem_cache != nullptr; }
+
+    const String & getCacheName() const override { return filesystem_cache_name; }
+
+    NameSet getCacheLayersNames() const override
+    {
+        if (filesystem_cache)
+            return {filesystem_cache_name};
+        return {};
+    }
+
     SyncGuardPtr getDirectorySyncGuard(const String & path) const override;
 
     void applyNewSettings(const Poco::Util::AbstractConfiguration & config, ContextPtr context, const String & config_prefix, const DisksMap &) override;
@@ -161,11 +178,39 @@ protected:
 private:
     bool tryReserve(UInt64 bytes, const std::optional<ReservationConstraints> & constraints, UInt64 & unreserved_space);
 
+    /// Filesystem-cache key for a regular file: the device and inode identity
+    /// (`st_dev`, `st_ino`), which is known when a new file is opened for write
+    /// and stays invariant across renames and hard links. Every in-place mutation
+    /// or unlink invalidates the entry for that inode.
+    static FileCacheKey makeFileCacheKey(const struct stat & file_stat);
+
+    /// Drop the cached entry for the file currently at `path`, if it is a regular file.
+    /// Used before/after in-place mutations and before unlinking so inode reuse
+    /// cannot serve a stale entry.
+    void invalidateCacheEntry(const String & path) const;
+    void invalidateCacheEntry(const struct stat & file_stat) const;
+
+    /// Drop the cached entry for `path` before unlinking it, except when `path` is a
+    /// frozen clone under `shadow/` that still has other hard links: `ALTER TABLE ... FREEZE`
+    /// clones a part into `shadow/` with hard links, and removing those links on
+    /// `UNFREEZE` must keep the still-live part's entry. Every other removal evicts
+    /// even for multi-link files, because another link (e.g. a backup copy) may be
+    /// unlinked outside this server, where the eviction would never happen.
+    void invalidateCacheEntryBeforeUnlink(const String & path) const;
+
+    void invalidateCacheTree(const String & path) const;
+
     /// Setup disk for healthy check.
     /// Throw exception if it's not possible to setup necessary files and directories.
     void setup();
 
     const String disk_path;
+    FileCachePtr filesystem_cache;
+    String filesystem_cache_name;
+    /// When the filesystem cache is active, release this disk's own page-cache pages
+    /// behind reads/writes whose bytes are (being) duplicated into the cache, so the
+    /// same data is not kept in RAM twice. Linux only, best-effort.
+    bool drop_page_cache_when_filesystem_cache_enabled = true;
     std::atomic<UInt64> keep_free_space_bytes;
     LoggerPtr logger;
     DataSourceDescription data_source_description;

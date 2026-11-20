@@ -1,0 +1,28 @@
+Read-through populates the cache
+10000	49995000
+10000	49995000
+1
+10000	49995000
+Rewrite of a file at the same path is not served stale from the cache
+10000	1049995000
+Mutation and merge after priming
+10000	1049995010
+Delete and recreate with the same row count
+1000	499500
+1000	5499500
+Write-through populates the cache on INSERT and merge without cold reads
+1
+5000	12497500	147500
+1	1
+10000	49995000	295000
+1	1
+FREEZE and UNFREEZE keep the live part entries in the cache
+1
+1
+20000	199990000	800000
+1	1
+1
+Removing a part while an external backup copy of it exists evicts the cache
+1
+1
+1

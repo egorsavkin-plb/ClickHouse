@@ -31,6 +31,7 @@ namespace FailPoints
 {
     extern const char file_cache_slru_downgrade_fail_before_finalize[];
     extern const char file_cache_slru_pause_promotion_before_downgrade[];
+    extern const char file_cache_slru_downgrade_always_fail_before_finalize[];
     extern const char file_cache_modify_size_limits_fail[];
 }
 
@@ -513,7 +514,8 @@ bool SLRUFileCachePriority::collectCandidatesForEvictionInProtected(
             /// Invalidate the new probationary `PreActive` entry, and
             /// reset the old protected entry's `Evicting` flag back to `Active`.
             new_nested_iterator.invalidate();
-            prev_entry->resetFlag(Entry::State::Evicting);
+            if (prev_entry->getState() == Entry::State::Evicting)
+                prev_entry->resetFlag(Entry::State::Evicting);
             rollbacked = true;
         }
     };
@@ -584,6 +586,13 @@ bool SLRUFileCachePriority::collectCandidatesForEvictionInProtected(
     /// Set incrementing size callback, as explained in the previous comment.
     res.addAfterEvictStateCallback([=, this](const CacheStateGuard::Lock & lk)
     {
+        /// Deterministic variant for tests; unlike the one below it is not enabled in stress tests.
+        fiu_do_on(FailPoints::file_cache_slru_downgrade_always_fail_before_finalize,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED,
+                            "Injected fault before SLRU downgrade finalization");
+        });
+
         fiu_do_on(FailPoints::file_cache_slru_downgrade_fail_before_finalize,
         {
             static constexpr double fault_probability = 0.001;

@@ -1,0 +1,8 @@
+Cold read (read-through into cache) with prefetch
+OK
+1
+Warm read (cache hits) with prefetch, single and multi-threaded
+OK
+OK
+Subset (seek) read with prefetch
+OK

@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+# shellcheck source=./cache.lib
+. "$CUR_DIR"/cache.lib
+
+CACHE_NAME='local_disk_cached'
+READ_CACHED="enable_filesystem_cache = 1"
+READ_UNCACHED="enable_filesystem_cache = 0"
+
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cached_a SYNC"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cached_b SYNC"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cached_c SYNC"
+
+drop_filesystem_cache $CACHE_NAME
+
+echo 'Read-through populates the cache'
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_cached_a (x UInt64, v UInt64) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached'"
+${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES t_cached_a"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cached_a SELECT number, number FROM numbers(10000)"
+${CLICKHOUSE_CLIENT} --query "SELECT count(), sum(v) FROM t_cached_a SETTINGS $READ_UNCACHED"
+${CLICKHOUSE_CLIENT} --query "SELECT count(), sum(v) FROM t_cached_a SETTINGS $READ_CACHED"
+${CLICKHOUSE_CLIENT} --query "SELECT count() > 0 FROM system.filesystem_cache WHERE cache_name = '$CACHE_NAME'"
+${CLICKHOUSE_CLIENT} --query "SELECT count(), sum(v) FROM t_cached_a SETTINGS $READ_CACHED"
+
+echo 'Rewrite of a file at the same path is not served stale from the cache'
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_cached_b (x UInt64, v UInt64) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached'"
+${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES t_cached_b"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cached_b SELECT number, number + 100000 FROM numbers(10000)"
+
+part_a=$(${CLICKHOUSE_CLIENT} --query "SELECT path FROM system.parts WHERE database = currentDatabase() AND table = 't_cached_a' AND name = 'all_1_1_0'")
+part_b=$(${CLICKHOUSE_CLIENT} --query "SELECT path FROM system.parts WHERE database = currentDatabase() AND table = 't_cached_b' AND name = 'all_1_1_0'")
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cached_a DETACH PART 'all_1_1_0'"
+cp -f "${part_b}"/* "$(dirname "$part_a")/detached/all_1_1_0/"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cached_a ATTACH PART 'all_1_1_0'"
+${CLICKHOUSE_CLIENT} --query "SYSTEM CLEAR MARK CACHE"
+${CLICKHOUSE_CLIENT} --query "SYSTEM CLEAR UNCOMPRESSED CACHE"
+# t_cached_a now holds the data of t_cached_b (sum(v) = sum(number + 100000)).
+${CLICKHOUSE_CLIENT} --query "SELECT count(), sum(v) FROM t_cached_a SETTINGS $READ_CACHED"
+
+echo 'Mutation and merge after priming'
+${CLICKHOUSE_CLIENT} --query "SYSTEM START MERGES t_cached_a"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cached_a UPDATE v = v + 1 WHERE x < 10 SETTINGS mutations_sync = 1"
+${CLICKHOUSE_CLIENT} --query "OPTIMIZE TABLE t_cached_a FINAL"
+${CLICKHOUSE_CLIENT} --query "SELECT count(), sum(v) FROM t_cached_a SETTINGS $READ_CACHED"
+
+echo 'Delete and recreate with the same row count'
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_cached_c (x UInt64, v UInt64) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached'"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cached_c SELECT number, number FROM numbers(1000)"
+${CLICKHOUSE_CLIENT} --query "SELECT count(), sum(v) FROM t_cached_c SETTINGS $READ_CACHED"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cached_c SYNC"
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_cached_c (x UInt64, v UInt64) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached'"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cached_c SELECT number, number + 5000 FROM numbers(1000)"
+${CLICKHOUSE_CLIENT} --query "SELECT count(), sum(v) FROM t_cached_c SETTINGS $READ_CACHED"
+
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cached_a SYNC"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cached_b SYNC"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cached_c SYNC"
+drop_filesystem_cache $CACHE_NAME
+
+echo 'Write-through populates the cache on INSERT and merge without cold reads'
+WT_CACHE='local_disk_cached_write_through'
+drop_filesystem_cache $WT_CACHE
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_wt SYNC"
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_wt (x UInt64, s String) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached_write_through', min_bytes_for_wide_part = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES t_wt"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_wt SELECT number, repeat('v', (number % 40) + 10) FROM numbers(5000)"
+${CLICKHOUSE_CLIENT} --query "SELECT count() > 0 FROM system.filesystem_cache WHERE cache_name = '$WT_CACHE'"
+# Read with read_from_filesystem_cache_if_exists_otherwise_bypass_cache: every byte is served from the write-through cache.
+${CLICKHOUSE_CLIENT} --query_id="wt_read_1_${CLICKHOUSE_DATABASE}" --query "
+    SELECT count(), sum(x), sum(length(s)) FROM t_wt
+    SETTINGS $READ_CACHED, read_from_filesystem_cache_if_exists_otherwise_bypass_cache = 1"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT ProfileEvents['CachedReadBufferReadFromCacheHits'] > 0,
+           ProfileEvents['CachedReadBufferReadFromCacheMisses'] = 0
+    FROM system.query_log
+    WHERE current_database = currentDatabase() AND query_id = 'wt_read_1_${CLICKHOUSE_DATABASE}' AND type = 'QueryFinish'
+    ORDER BY event_time_microseconds DESC LIMIT 1"
+
+# A second insert and a merge also populate the new merged part in the cache and evict the old source parts.
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_wt SELECT number + 5000, repeat('w', (number % 40) + 10) FROM numbers(5000)"
+${CLICKHOUSE_CLIENT} --query "SYSTEM START MERGES t_wt"
+${CLICKHOUSE_CLIENT} --query "OPTIMIZE TABLE t_wt FINAL"
+${CLICKHOUSE_CLIENT} --query_id="wt_read_2_${CLICKHOUSE_DATABASE}" --query "
+    SELECT count(), sum(x), sum(length(s)) FROM t_wt
+    SETTINGS $READ_CACHED, read_from_filesystem_cache_if_exists_otherwise_bypass_cache = 1"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT ProfileEvents['CachedReadBufferReadFromCacheHits'] > 0,
+           ProfileEvents['CachedReadBufferReadFromCacheMisses'] = 0
+    FROM system.query_log
+    WHERE current_database = currentDatabase() AND query_id = 'wt_read_2_${CLICKHOUSE_DATABASE}' AND type = 'QueryFinish'
+    ORDER BY event_time_microseconds DESC LIMIT 1"
+
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_wt SYNC"
+drop_filesystem_cache $WT_CACHE
+
+echo 'FREEZE and UNFREEZE keep the live part entries in the cache'
+# `ALTER TABLE ... FREEZE` hard-links the part into `shadow/`, so the frozen clone shares the
+# live part's inodes. `UNFREEZE` then removes those links; the removal must not evict the cache
+# entries of a part that is still live (`st_nlink` back to 1 after the unlink).
+drop_filesystem_cache $WT_CACHE
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_freeze SYNC"
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_freeze (x UInt64, s String) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached_write_through', min_bytes_for_wide_part = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES t_freeze"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_freeze SELECT number, repeat('f', 40) FROM numbers(20000)"
+${CLICKHOUSE_CLIENT} --query "SELECT count() > 0 FROM system.filesystem_cache WHERE cache_name = '$WT_CACHE'"
+# Cache size is stable across the backup-style freeze/unfreeze cycle.
+${CLICKHOUSE_CLIENT} --query "SELECT current_size > 0 FROM system.filesystem_cache_settings WHERE cache_name = '$WT_CACHE'"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_freeze FREEZE WITH NAME 'test_05453'"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_freeze UNFREEZE WITH NAME 'test_05453'"
+# Every byte is still served from the cache: the unlink of the `shadow/` links must not have evicted it.
+${CLICKHOUSE_CLIENT} --query_id="freeze_read_${CLICKHOUSE_DATABASE}" --query "
+    SELECT count(), sum(x), sum(length(s)) FROM t_freeze
+    SETTINGS $READ_CACHED, read_from_filesystem_cache_if_exists_otherwise_bypass_cache = 1"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT ProfileEvents['CachedReadBufferReadFromCacheHits'] > 0,
+           ProfileEvents['CachedReadBufferReadFromCacheMisses'] = 0
+    FROM system.query_log
+    WHERE current_database = currentDatabase() AND query_id = 'freeze_read_${CLICKHOUSE_DATABASE}' AND type = 'QueryFinish'
+    ORDER BY event_time_microseconds DESC LIMIT 1"
+# Dropping the table does evict it: the last link to the inode is gone.
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_freeze SYNC"
+${CLICKHOUSE_CLIENT} --query "SELECT current_size = 0 FROM system.filesystem_cache_settings WHERE cache_name = '$WT_CACHE'"
+
+drop_filesystem_cache $WT_CACHE
+
+echo 'Removing a part while an external backup copy of it exists evicts the cache'
+# Altinity `clickhouse-backup` hard-links the frozen part into its own backup directory and,
+# after the upload, deletes that copy directly on the filesystem, outside the server. If the
+# live part is removed (merge, `DROP`, ...) while such a copy still exists, the server never
+# observes the copy's unlink, so it must evict at the live removal already -- deferring to
+# the last unlink leaks the entry (its inode is gone from the data disk, yet the cache keeps it).
+drop_filesystem_cache $WT_CACHE
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_backup SYNC"
+${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE t_backup (x UInt64, s String) ENGINE = MergeTree ORDER BY x
+    SETTINGS storage_policy = 'local_disk_cached_write_through', min_bytes_for_wide_part = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES t_backup"
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_backup SELECT number, repeat('b', 40) FROM numbers(20000)"
+${CLICKHOUSE_CLIENT} --query "SELECT count() > 0 FROM system.filesystem_cache WHERE cache_name = '$WT_CACHE'"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_backup FREEZE WITH NAME 'test_05453_backup'"
+part_backup=$(${CLICKHOUSE_CLIENT} --query "SELECT path FROM system.parts WHERE database = currentDatabase() AND table = 't_backup' AND active LIMIT 1")
+# The backup tool's own hard-linked copy of the part, outside the table directory.
+backup_clone="$(dirname "$(dirname "$part_backup")")/bak05453_${CLICKHOUSE_DATABASE}"
+rm -rf "$backup_clone"
+cp -al "$part_backup" "$backup_clone"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_backup UNFREEZE WITH NAME 'test_05453_backup'"
+# The frozen clone is gone, but the live part (and the backup copy) still share the inodes:
+# the entry survives `UNFREEZE`, as in the case above.
+${CLICKHOUSE_CLIENT} --query "SELECT current_size > 0 FROM system.filesystem_cache_settings WHERE cache_name = '$WT_CACHE'"
+# Removing the live part evicts despite the backup copy's extra hard link.
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_backup SYNC"
+${CLICKHOUSE_CLIENT} --query "SELECT current_size = 0 FROM system.filesystem_cache_settings WHERE cache_name = '$WT_CACHE'"
+rm -rf "$backup_clone"
+
+drop_filesystem_cache $WT_CACHE

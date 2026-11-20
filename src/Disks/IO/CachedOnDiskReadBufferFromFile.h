@@ -51,6 +51,8 @@ public:
 
     bool nextImpl() override;
 
+    void prefetch(Priority priority) override;
+
     off_t seek(off_t off, int whence) override;
 
     off_t getPosition() override;
@@ -140,6 +142,9 @@ public:
     };
 
 private:
+    /// Like `info.reset()`, but keeps the opened cache file reader (see the definition).
+    void resetKeepingCacheFileReader();
+
     /// A state for reading from a single file segment
     /// (part of object storage file).
     struct ReadFromFileSegmentState

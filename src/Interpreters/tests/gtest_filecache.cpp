@@ -4172,7 +4172,7 @@ TEST_F(FileCacheTest, SLRUDowngradeRollbackResetsEvictingOnSkippedFinalization)
 
 TEST_F(FileCacheTest, SLRUDowngradeAbortedByFailpointPreservesAccounting)
 {
-    /// `file_cache_slru_downgrade_fail_before_finalize` throws in the protected-downgrade
+    /// `file_cache_slru_downgrade_always_fail_before_finalize` throws in the protected-downgrade
     /// state-finalization step (after `afterEvictWrite`). Rollback must keep queue accounting
     /// consistent so a subsequent reserve/hold does not hit poisoned counters.
     ServerUUID::setRandomForUnitTests();
@@ -4220,8 +4220,8 @@ TEST_F(FileCacheTest, SLRUDowngradeAbortedByFailpointPreservesAccounting)
   auto reservee = add_protected_segment(10, 5);
     ASSERT_EQ(priority.getProtectedSize(state_guard.lock()), 15);
 
-    FailPointInjection::enableFailPoint("file_cache_slru_downgrade_fail_before_finalize");
-    SCOPE_EXIT({ FailPointInjection::disableFailPoint("file_cache_slru_downgrade_fail_before_finalize"); });
+    FailPointInjection::enableFailPoint("file_cache_slru_downgrade_always_fail_before_finalize");
+    SCOPE_EXIT({ FailPointInjection::disableFailPoint("file_cache_slru_downgrade_always_fail_before_finalize"); });
 
     for (size_t attempt = 0; attempt < 25; ++attempt)
     {
@@ -4256,7 +4256,7 @@ TEST_F(FileCacheTest, SLRUDowngradeAbortedByFailpointPreservesAccounting)
             /* is_total_space_cleanup */ false, origin, lock));
     }
 
-    FailPointInjection::disableFailPoint("file_cache_slru_downgrade_fail_before_finalize");
+    FailPointInjection::disableFailPoint("file_cache_slru_downgrade_always_fail_before_finalize");
     {
         EvictionInfoPtr eviction_info = priority.collectEvictionInfo(
             /* size */ 5, /* elements */ 0, reservee.get(),

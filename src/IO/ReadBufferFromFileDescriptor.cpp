@@ -190,6 +190,18 @@ void ReadBufferFromFileDescriptor::prefetch(Priority)
     /// Ask OS to prefetch data into page cache.
     if (0 != posix_fadvise(fd, file_offset_of_buffer_end, internal_buffer.size(), POSIX_FADV_WILLNEED))
         throw ErrnoException(ErrorCodes::CANNOT_ADVISE, "Cannot posix_fadvise");
+#elif defined(OS_DARWIN)
+    /// macOS has no `posix_fadvise`; `F_RDADVISE` is the asynchronous advisory read into the unified buffer cache.
+    if (required_alignment)
+        return;
+
+    /// `ra_count` is a 32-bit `int`, so the range is clamped to `INT_MAX`.
+    struct radvisory advice{};
+    advice.ra_offset = file_offset_of_buffer_end;
+    advice.ra_count = static_cast<int>(std::min<size_t>(internal_buffer.size(), std::numeric_limits<int>::max()));
+    /// `EFBIG` means the range starts at or past the end of the file: there is nothing to read ahead.
+    if (advice.ra_count > 0 && 0 != fcntl(fd, F_RDADVISE, &advice) && errno != EFBIG)
+        throw ErrnoException(ErrorCodes::CANNOT_ADVISE, "Cannot fcntl F_RDADVISE");
 #endif
 }
 

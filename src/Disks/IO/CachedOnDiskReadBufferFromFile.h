@@ -142,6 +142,9 @@ public:
     };
 
 private:
+    /// Like `info.reset()`, but keeps the opened cache file reader (see the definition).
+    void resetKeepingCacheFileReader();
+
     /// A state for reading from a single file segment
     /// (part of object storage file).
     struct ReadFromFileSegmentState

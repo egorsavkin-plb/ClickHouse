@@ -211,6 +211,7 @@ std::shared_ptr<const ConfigurationWithUsageTracking> DiskFactory::trackImplicit
     tracked_config->markAsUsed(config_prefix + ".type");
     tracked_config->markAsUsed(config_prefix + ".skip_access_check");
     tracked_config->markAsUsed(config_prefix + ".thread_pool_size");
+    tracked_config->markAsUsed(config_prefix + ".drop_page_cache_when_filesystem_cache_enabled");
     /// The nested filesystem-cache section that the creation of a `local` disk reads, see `registerDiskLocal`.
     for (const auto & column : FileCacheSettings::getColumnsDescription())
         tracked_config->markAsUsed(config_prefix + ".filesystem_cache." + column.name);

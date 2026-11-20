@@ -177,6 +177,7 @@ static struct InitFiu
     REGULAR(file_cache_dynamic_resize_fail_to_evict) \
     REGULAR(file_cache_background_eviction_push_fail) \
     REGULAR(file_cache_slru_downgrade_fail_before_finalize) \
+    REGULAR(file_cache_slru_downgrade_always_fail_before_finalize) \
     REGULAR(file_cache_modify_size_limits_fail) \
     REGULAR(check_table_query_delay_for_part) \
     ONCE(check_table_inject_retryable_zk_error) \

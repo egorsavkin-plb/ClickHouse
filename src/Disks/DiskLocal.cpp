@@ -172,7 +172,8 @@ public:
         /// `WriteBufferFromFile` without going through `CachedOnDiskWriteBufferFromFile::nextImpl`.
         next();
         WriteBufferFromFileDecorator::preFinalize();
-        dropSourcePageCacheFinal();
+        /// No `fsync` follows here, so only start writeback of the tail without waiting for it.
+        startTailWriteback();
     }
 
     void sync() override
@@ -184,6 +185,7 @@ public:
             SwapHelper swap(*this, *impl);
             impl->sync();
         }
+        /// The data is durable now, so the wait inside is a no-op.
         dropSourcePageCacheFinal();
     }
 
@@ -238,12 +240,22 @@ private:
         const off_t written = static_cast<off_t>(count());
         while (written >= next_drop_boundary)
         {
-            /// Kick writeback on the window just completed (async), then wait for and
-            /// drop everything before it — it has had a full window of time to write back.
+            /// Kick writeback on the window just completed (async). Wait for and drop only windows
+            /// kicked `drop_lag_windows` windows ago: they have had that long to reach the disk, so the
+            /// wait almost never blocks the writer on EBS latency (inserts and merges are latency sensitive).
             ::sync_file_range(source_fd, next_drop_boundary - drop_window_size, drop_window_size, SYNC_FILE_RANGE_WRITE);
-            writeBackAndDrop(next_drop_boundary - drop_window_size);
+            writeBackAndDrop(next_drop_boundary - drop_lag_windows * drop_window_size);
             next_drop_boundary += drop_window_size;
         }
+    }
+
+    void startTailWriteback()
+    {
+        if (source_fd < 0 || writeThroughCachingStopped())
+            return;
+        const off_t written = static_cast<off_t>(count());
+        if (written > dropped_upto)
+            ::sync_file_range(source_fd, dropped_upto, written - dropped_upto, SYNC_FILE_RANGE_WRITE);
     }
 
     void dropSourcePageCacheFinal()
@@ -254,11 +266,26 @@ private:
     }
 
     static constexpr off_t drop_window_size = 8 * 1024 * 1024;
+    static constexpr off_t drop_lag_windows = 3;
     off_t next_drop_boundary = drop_window_size;
     off_t dropped_upto = 0;
+#elif defined(OS_DARWIN)
+    /// macOS has no `sync_file_range`/`posix_fadvise`: `F_NOCACHE` on the descriptor makes the rest of the
+    /// writes bypass the unified buffer cache, so the written bytes are not kept in RAM a second time.
+    void dropSourcePageCacheBehind()
+    {
+        if (source_fd < 0 || nocache_set || writeThroughCachingStopped())
+            return;
+        ::fcntl(source_fd, F_NOCACHE, 1);
+        nocache_set = true;
+    }
+    void dropSourcePageCacheFinal() {}
+    void startTailWriteback() {}
+    bool nocache_set = false;
 #else
     void dropSourcePageCacheBehind() {}
     void dropSourcePageCacheFinal() {}
+    void startTailWriteback() {}
 #endif
 
     FileCachePtr cache;

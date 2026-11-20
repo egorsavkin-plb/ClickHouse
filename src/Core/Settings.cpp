@@ -8750,7 +8750,8 @@ Method of reading data from remote filesystem, one of: read, threadpool.
 )", 0) \
     DECLARE(Bool, local_filesystem_read_prefetch, true, R"(
 Should use prefetching when reading data from local filesystem.
-)", 0) \
+)", 0, \
+        {"26.11", false, true, "Enable prefetching for local filesystem reads, so that the filesystem cache of a `local` disk prefetches its segments. TODO: turn the default back to `false`."}) \
     DECLARE(Bool, remote_filesystem_read_prefetch, true, R"(
 Should use prefetching when reading data from remote filesystem.
 )", 0) \

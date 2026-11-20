@@ -4,7 +4,6 @@
 #include <pcg-random/pcg_random.hpp>
 #include <Common/CurrentMetrics.h>
 #include <Common/CurrentThread.h>
-#include <Common/Exception.h>
 #include <Common/LockMemoryExceptionInThread.h>
 #include <Common/logger_useful.h>
 #include <Common/randomSeed.h>
@@ -61,28 +60,14 @@ void LRUFileCachePriority::State::sub(uint64_t size_, uint64_t elements_)
 
     if (size_)
     {
-        const size_t prev = size.load(std::memory_order_relaxed);
-        if (size_ > prev)
-        {
-            throw Exception(
-                ErrorCodes::LOGICAL_ERROR,
-                "Filesystem cache size counter underflow (subtract {}, have {})",
-                size_, prev);
-        }
+        chassert(size >= size_);
         size -= size_;
         CurrentMetrics::sub(CurrentMetrics::FilesystemCacheSize, size_);
     }
 
     if (elements_)
     {
-        const size_t prev = elements_num.load(std::memory_order_relaxed);
-        if (elements_ > prev)
-        {
-            throw Exception(
-                ErrorCodes::LOGICAL_ERROR,
-                "Filesystem cache element counter underflow (subtract {}, have {})",
-                elements_, prev);
-        }
+        chassert(elements_num >= elements_);
         elements_num -= elements_;
         CurrentMetrics::sub(CurrentMetrics::FilesystemCacheElements, elements_);
     }
@@ -1009,31 +994,8 @@ void LRUFileCachePriority::releaseImpl(size_t size, size_t elements)
 {
     state->sub(size, elements);
 
-    if (size)
-    {
-        const size_t prev = total_hold_size.load(std::memory_order_relaxed);
-        if (size > prev)
-        {
-            throw Exception(
-                ErrorCodes::LOGICAL_ERROR,
-                "Filesystem cache hold size counter underflow in {} (subtract {}, have {})",
-                description, size, prev);
-        }
-        total_hold_size -= size;
-    }
-
-    if (elements)
-    {
-        const size_t prev = total_hold_elements.load(std::memory_order_relaxed);
-        if (elements > prev)
-        {
-            throw Exception(
-                ErrorCodes::LOGICAL_ERROR,
-                "Filesystem cache hold element counter underflow in {} (subtract {}, have {})",
-                description, elements, prev);
-        }
-        total_hold_elements -= elements;
-    }
+    total_hold_size -= size;
+    total_hold_elements -= elements;
 
     //LOG_TEST(log, "Released {} by size and {} by elements", size, elements);
 }
